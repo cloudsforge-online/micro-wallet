@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env
+.env.test
+.demo-*
+*.log
+src/**/*.test.ts
+src/testsupport.ts

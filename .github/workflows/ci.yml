@@ -1,0 +1,229 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03), everything below is deleted
+# and replaced by a call to the shared reusable workflow:
+#
+#   jobs:
+#     ci:
+#       uses: cloudsforge/.github/.github/workflows/service-ci.yml@v1
+#       with:
+#         service: wallet
+#         database-url-var: WALLET_DATABASE_URL
+#       secrets: inherit
+#
+# The measured target in docs/ecosystem/03 §5 is **zero repositories with a bespoke CI file**, so
+# treat every line here as a liability with a deletion date rather than as something to extend.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the duration of one job, is reachable only from
+        # it, and holds nothing. A real value here would be a real value in a public log.
+        env:
+          POSTGRES_USER: wallet
+          POSTGRES_PASSWORD: wallet
+          POSTGRES_DB: wallet_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U wallet"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # Temporary: the three checkouts and the sibling layout exist only because the runtime and
+      # contracts packages are unpublished. On publish this collapses to one checkout with no
+      # `path:`.
+      - uses: actions/checkout@v4
+        with:
+          path: wallet
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: wallet/pnpm-lock.yaml
+
+      # `link:` resolves to the sibling's own node_modules, so the siblings must be installed
+      # before this repository is. That is the price of `link:`, and it is worth paying: `file:`
+      # packs the dependency and each of these packages declares files: ["dist"], so a packed
+      # install resolves its exports to a dist/ that was never built.
+      - name: Install the siblings
+        run: |
+          pnpm --dir runtime install --frozen-lockfile
+          pnpm --dir contracts install --frozen-lockfile
+
+      - name: Install
+        working-directory: wallet
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: wallet
+        run: pnpm typecheck
+
+      - name: Migrate the test database
+        working-directory: wallet
+        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
+        # it. A schema created by the test suite instead would never prove the one-shot job works.
+        env:
+          WALLET_DATABASE_URL: postgres://wallet:wallet@127.0.0.1:5432/wallet_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+          LEDGER_URL: http://127.0.0.1:4004
+          CUSTODY_URL: http://127.0.0.1:4005
+          INDEXER_URL: http://127.0.0.1:4006
+          PRICING_URL: http://127.0.0.1:4007
+          WALLET_SERVICE_TOKEN: ci-only-not-a-real-token-0000000000000
+          WALLET_CHALLENGE_DOMAIN: ci.test
+          WALLET_CHALLENGE_URI: http://ci.test/verify
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: wallet
+        env:
+          WALLET_TEST_DATABASE_URL: postgres://wallet:wallet@127.0.0.1:5432/wallet_test
+        run: pnpm test
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  # §3.7 of the current-state audit is the evidence that discipline alone has already failed.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — one database, and it is this service''s own'
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
+             | grep -vE 'WALLET_DATABASE_URL|WALLET_TEST_DATABASE_URL'; then
+            echo '::error::a connection string other than WALLET_DATABASE_URL is referenced'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' | grep -v '\.test\.ts'; then
+            echo '::error::a literal connection string appears outside a test'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "'$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 7 — migrations are never run by the service process'
+        run: |
+          if grep -nE '\bmigrate\(' src/index.ts; then
+            echo '::error::index.ts calls migrate — that is the migrator job, not the service'
+            exit 1
+          fi
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      # This service owns no balances. 04-domain-model §11: "No 'user balance' column anywhere
+      # outside the ledger's projection. A cached balance in a product database is the bug that
+      # made Crucible's bot state diverge from Pay's."
+      - name: 'AD — no balance column anywhere in the schema'
+        run: |
+          if grep -nE '^\s+(balance|shards|last_seen|swept)\s+(numeric|bigint|text)' src/migrations.ts; then
+            echo '::error::a running-total column was added; balances belong to the ledger'
+            exit 1
+          fi
+
+      # contracts-chain is exact-pinned by wallet, settlement, custody and indexer. A caret there
+      # is money credited at the wrong depth.
+      - name: 'AD-02 — contracts-chain is never caret-ranged'
+        run: |
+          if grep -nE '"@cloudsforge/contracts-chain":\s*"\^' package.json; then
+            echo '::error::contracts-chain must be exact-pinned, never caret-ranged'
+            exit 1
+          fi
+
+      # Confirmation depths, decimals and rate scale are read from contracts-chain and never
+      # restated. A second declaration is the skew the exact pin exists to prevent.
+      - name: 'AD — confirmation policy is read, never restated'
+        run: |
+          if grep -rnE '\b(confirmations|decimals)\s*[:=]\s*[0-9]+' src/ --include='*.ts' \
+             | grep -vE '\.test\.ts|src/testsupport\.ts'; then
+            echo '::error::a confirmation depth or decimals literal was declared; read contracts-chain'
+            exit 1
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      # Temporary, and for the same reason as above.
+      - uses: actions/checkout@v4
+        with:
+          path: wallet
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-runtime
+          path: runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/micro-contracts
+          path: contracts
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: wallet
+          # Temporary: drops out with the link: dependencies.
+          build-contexts: |
+            runtimepkgs=runtime
+            contractpkgs=contracts
+          push: false
+          load: true
+          tags: wallet:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 'The image must not run as root'
+        run: |
+          user=$(docker image inspect wallet:${{ github.sha }} --format '{{.Config.User}}')
+          [ "$user" = "node" ] || { echo "::error::image runs as '${user:-root}'"; exit 1; }
+
+      - name: 'The image must not carry a secret'
+        run: |
+          if docker image inspect wallet:${{ github.sha }} --format '{{json .Config.Env}}' \
+             | grep -iE 'secret|token|password|key'; then
+            echo '::error::a secret-shaped value is baked into the image environment'
+            exit 1
+          fi

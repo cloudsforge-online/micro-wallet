@@ -1,0 +1,60 @@
+{
+  "name": "@cloudsforge/wallet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The user-facing money API. Wallet registry, external wallet links and verification, deposit address assignment, withdrawal requests, conversions, transfers and the portfolio read. Owns no balances and no keys.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node --import tsx src/index.ts",
+    "migrate": "node --import tsx src/migrator.ts",
+    "typecheck": "tsc --noEmit",
+    "_test": "--test-concurrency=1 is required, not a preference: every database test file truncates this service's tables between cases, and node:test runs FILES in parallel by default. A TRUNCATE takes an AccessExclusiveLock, so one file's reset deadlocks against another file's inserts (40P01). Cases within a file already run in order.",
+    "test": "node --import tsx --test --test-concurrency=1 src/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "_localDependencies": [
+    "The @cloudsforge/* packages are consumed from sibling checkouts because none of them is",
+    "published yet. Once AD-02 lands they all become registry versions and these paths — plus the",
+    "two build contexts in the Dockerfile and the extra checkouts in CI — are deleted. Nothing else",
+    "in this repository changes.",
+    "",
+    "Every sibling takes 'link:', not 'file:'. A 'file:' path PACKS the dependency, and each of",
+    "these packages declares files: ['dist'] with a publishConfig that points main/types at dist/.",
+    "Packing therefore installs a package whose exports resolve to a dist/ that has not been built,",
+    "while its 'main' in the working tree still says src/index.ts — the web template hit exactly",
+    "this and the symptom is an unresolvable import of a package that is plainly present. 'link:'",
+    "symlinks the checkout in place, so the working-tree manifest is the one that is read and the",
+    "package keeps using its own already-installed node_modules. That last part is also what",
+    "@cloudsforge/contracts-money needs: it depends on contracts-chain with the 'workspace:^'",
+    "protocol, which only resolves inside the contracts workspace.",
+    "",
+    "@cloudsforge/contracts-chain is EXACT-PINNED on publish ('1.0.0'), never caret-ranged. wallet,",
+    "settlement, custody and indexer must agree byte-for-byte on confirmation depths and amount",
+    "maths; a skew there is not a 500, it is money credited at the wrong depth.",
+    "",
+    "tsx is a runtime dependency for the same reason: the unpublished packages resolve to their",
+    "TypeScript sources. On publish their publishConfig points at dist/, tsx moves to",
+    "devDependencies, and the image runs 'node dist/index.js'."
+  ],
+  "dependencies": {
+    "@cloudsforge/auth": "link:../runtime/packages/auth",
+    "@cloudsforge/contracts-chain": "link:../contracts/packages/chain",
+    "@cloudsforge/contracts-money": "link:../contracts/packages/money",
+    "@cloudsforge/db": "link:../runtime/packages/db",
+    "@cloudsforge/http": "link:../runtime/packages/http",
+    "@cloudsforge/jobs": "link:../runtime/packages/jobs",
+    "@cloudsforge/lifecycle": "link:../runtime/packages/lifecycle",
+    "@cloudsforge/telemetry": "link:../runtime/packages/telemetry",
+    "postgres": "^3.4.5",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "jose": "^5.9.6",
+    "typescript": "^5.7.2"
+  }
+}
