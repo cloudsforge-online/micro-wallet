@@ -72,18 +72,28 @@ export function httpPricingClient(options: PricingClientOptions): PricingClient 
     async quotes(assets) {
       if (assets.length === 0) return new Map()
       try {
-        const body = await client.get<{ quotes: readonly RawQuote[] }>(
-          `/v1/quotes?assets=${encodeURIComponent(assets.join(','))}`,
-        )
+        // `GET /rates`, not `/v1/quotes`. The latter never existed — this client was written
+        // against an imagined surface and would have 404'd in production. Found by micro-hub-api
+        // reading both services' route tables side by side, which is exactly the class of defect
+        // consumer-driven contract tests exist to catch before a deploy does.
+        //
+        // The board is returned whole rather than filtered by asset: it is a small, fixed set,
+        // it is the same response every caller gets so it caches once, and asking for a subset
+        // would let the board silently forget an asset exists.
+        const body = await client.get<{ rates: readonly RawRate[] }>('/rates')
+        const wanted = new Set<string>(assets)
         const out = new Map<LedgerAssetCode, Quote>()
-        for (const raw of body.quotes) {
-          // A quote with no rate is skipped rather than defaulted. See the header.
-          if (raw.usdPerCoinScaled === null) continue
-          out.set(raw.assetCode, {
-            assetCode: raw.assetCode,
-            usdPerCoinScaled: BigInt(raw.usdPerCoinScaled),
-            asOf: raw.asOf,
-            source: raw.source,
+        for (const rate of body.rates) {
+          if (!wanted.has(rate.asset)) continue
+          // An unusable rate is skipped rather than defaulted. Pricing answers 200 with a reason
+          // instead of a 404, because the asset does exist — it is the price that is missing, and
+          // valuing a holding at a stale or absent rate is worse than declining to value it.
+          if (!rate.usable) continue
+          out.set(rate.asset as LedgerAssetCode, {
+            assetCode: rate.asset as LedgerAssetCode,
+            usdPerCoinScaled: BigInt(rate.usdScaled),
+            asOf: rate.quotedAt,
+            source: rate.source,
           })
         }
         return out
@@ -100,9 +110,18 @@ export function httpPricingClient(options: PricingClientOptions): PricingClient 
   }
 }
 
-interface RawQuote {
-  readonly assetCode: LedgerAssetCode
-  readonly usdPerCoinScaled: string | null
-  readonly asOf: string
+/**
+ * One row of pricing's `GET /rates` board, as pricing actually serves it.
+ *
+ * `usable` is the field that matters. Pricing answers 200 for an asset whose rate is stale,
+ * absent or below the smallest quotable unit, carrying the reason — a 404 would be a lie about
+ * the asset existing, and a 503 would suggest that retrying helps when a refresh is what is
+ * needed. So the caller must read `usable` and not merely the presence of a number.
+ */
+interface RawRate {
+  readonly asset: string
+  readonly usable: boolean
+  readonly usdScaled: string
+  readonly quotedAt: string
   readonly source: string
 }
