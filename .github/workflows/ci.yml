@@ -57,12 +57,14 @@ jobs:
           path: wallet
       - uses: actions/checkout@v4
         with:
-          repository: cloudsforge/micro-runtime
+          repository: cloudsforge-online/micro-runtime
           path: runtime
+          token: ${{ secrets.ESTATE_READ_TOKEN }}
       - uses: actions/checkout@v4
         with:
-          repository: cloudsforge/micro-contracts
+          repository: cloudsforge-online/micro-contracts
           path: contracts
+          token: ${{ secrets.ESTATE_READ_TOKEN }}
 
       - uses: pnpm/action-setup@v4
         with:
@@ -192,12 +194,14 @@ jobs:
           path: wallet
       - uses: actions/checkout@v4
         with:
-          repository: cloudsforge/micro-runtime
+          repository: cloudsforge-online/micro-runtime
           path: runtime
+          token: ${{ secrets.ESTATE_READ_TOKEN }}
       - uses: actions/checkout@v4
         with:
-          repository: cloudsforge/micro-contracts
+          repository: cloudsforge-online/micro-contracts
           path: contracts
+          token: ${{ secrets.ESTATE_READ_TOKEN }}
 
       - uses: docker/setup-buildx-action@v3
 
