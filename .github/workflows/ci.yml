@@ -212,7 +212,7 @@ jobs:
           # Temporary: drops out with the link: dependencies.
           build-contexts: |
             runtimepkgs=runtime
-            contractpkgs=contracts
+            contractspkgs=contracts
           push: false
           load: true
           tags: wallet:${{ github.sha }}
