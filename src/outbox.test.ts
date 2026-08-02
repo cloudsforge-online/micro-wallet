@@ -74,6 +74,12 @@ test('every topic obeys the registry’s shape rule', () => {
   }
   // The consumed one must be spelled exactly as the indexer produces it, or nothing is delivered.
   assert.equal(INDEXER_DEPOSIT_CONFIRMED, 'indexer.deposit.confirmed')
+  // And the produced ones the registry names must be spelled exactly as IT does, for the same
+  // reason in the other direction: notify and activity classify `wallet.deposit.confirmed` and
+  // `wallet.wallet.created`, and a consumer cannot classify a name the registry has not declared.
+  assert.equal(DEPOSIT_CREDITED, 'wallet.deposit.confirmed')
+  assert.equal(WALLET_CREATED, 'wallet.wallet.created')
+  assert.equal(WITHDRAWAL_REQUESTED, 'wallet.withdrawal.requested')
 })
 
 test('a signature verifies, and one byte of tampering does not', () => {
@@ -215,6 +221,33 @@ test('the relay signs the exact bytes and keys the POST idempotently', { skip },
     ),
     true,
   )
+})
+
+/**
+ * The envelope a consumer will actually accept.
+ *
+ * Every event this service has relayed carried `version: 1`, a NUMBER, while
+ * `@cloudsforge/contracts-events` types the wire version as "major.minor" and its `validateEnvelope`
+ * refuses anything else with "version: missing". So a delivery whose signature verified was still
+ * rejected at the envelope by every consumer in the estate — silently, from this side. The bytes
+ * are checked here rather than the constant, because it is the bytes a subscriber parses.
+ */
+test('the relayed envelope carries the version shape consumers demand', { skip }, async () => {
+  await sql`insert into event_subscriptions (topic, url) values (${DEPOSIT_CREDITED}, 'http://activity.test/events')`
+  await withOutbox(db(), 'wallet', async (_tx, emit) => {
+    emit({ topic: DEPOSIT_CREDITED, key: 'w-1', payload: { amount: '1' } })
+  })
+
+  const { clientFor, calls } = stubClient()
+  await createRelay({ sql: db(), logger: quietLogger(), signingSecret: SECRET, clientFor })(relayJob, relayCtx)
+
+  const body = JSON.parse(JSON.stringify(calls[0]!.options.body)) as Record<string, unknown>
+  assert.equal(typeof body['version'], 'string', 'a numeric version is refused as "version: missing"')
+  assert.match(String(body['version']), /^\d+\.\d+$/)
+  assert.equal(body['version'], '1.0')
+  // The topic the registry names, so a consumer can classify it at all. `wallet.deposit.credited`
+  // was this service's own spelling of the registered `wallet.deposit.confirmed`.
+  assert.equal(body['topic'], 'wallet.deposit.confirmed')
 })
 
 test('a failing subscriber leaves the event unpublished and records why', { skip }, async () => {

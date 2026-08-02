@@ -10,7 +10,7 @@
  * problem with a solution.
  *
  * For this service the transaction that matters is the deposit credit: the `deposit_credits` row,
- * the idempotency response and the `wallet.deposit.credited` event are one commit. Nothing may
+ * the idempotency response and the `wallet.deposit.confirmed` event are one commit. Nothing may
  * observe a credited deposit that produced no event, or an event for a credit that did not land.
  *
  * Delivery is at-least-once. The consumer is what makes it effectively-once: `withInbox` inserts
@@ -33,12 +33,19 @@ export type Tx = TransactionSql
 /**
  * The topics this service produces.
  *
- * None is in `@cloudsforge/contracts-events` `TOPICS` yet. That registry is the only place a topic
- * name may be spelled, it is exact-pinned, and adding to it is a coordinated release — so they are
- * declared here for now and the registry entries land with the release that gives `activity`,
- * `notify` and `settlement` their subscriptions. Every one already satisfies the registry's shape
- * rule (`<service>.<aggregate>.<past-tense-verb>`, three lowercase segments), which
- * `outbox.test.ts` asserts, so registering them later is an addition and never a rename.
+ * Three of them ARE in `@cloudsforge/contracts-events` now — `wallet.wallet.created`,
+ * `wallet.deposit.confirmed` and `wallet.withdrawal.requested` — and the second of those is why
+ * this comment changed. It used to say none of these was registered and that "registering them
+ * later is an addition and never a rename". Two of the three were already registered, and the
+ * deposit one WAS a rename: the registry, `notify` and `activity` all spelled it
+ * `wallet.deposit.confirmed` while this service emitted `wallet.deposit.credited`, so every
+ * confirmed deposit was written, signed, delivered and refused as unclassifiable. It is exactly
+ * the defect identity found in `identity.mfa.changed`, and the resolution is the same one: the
+ * registry is the only place a topic name is spelled, so the producer moves to the registered
+ * name rather than the estate learning a second one.
+ *
+ * The rest are still unregistered and still shape-legal (`<service>.<aggregate>.<past-tense-verb>`,
+ * three lowercase segments), which `outbox.test.ts` asserts.
  *
  * `wallet.withdrawal.requested` is the one with a consumer that does not exist. **That is
  * deliberate and it is the point of the outbox**: the event is durable, so `micro-settlement`
@@ -50,7 +57,14 @@ export const WALLET_CREATED = 'wallet.wallet.created'
 export const WALLET_LINK_VERIFIED = 'wallet.link.verified'
 export const WALLET_LINK_REVOKED = 'wallet.link.revoked'
 export const DEPOSIT_ADDRESS_ASSIGNED = 'wallet.deposit_address.assigned'
-export const DEPOSIT_CREDITED = 'wallet.deposit.credited'
+/**
+ * Registered as `wallet.deposit.confirmed` — one of the eight FIRST topics of 02 §5.
+ *
+ * The constant keeps its name because "credited" is what this service does and what the row is
+ * called (`deposit_credits`); the WIRE name is the registry's, and the registry's keying is what
+ * this emit already used — `keyedBy: 'wallet_id'`, deposits.ts:658.
+ */
+export const DEPOSIT_CREDITED = 'wallet.deposit.confirmed'
 export const WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
 export const WITHDRAWAL_REFUNDED = 'wallet.withdrawal.refunded'
 export const WITHDRAWAL_STUCK = 'wallet.withdrawal.stuck'
@@ -61,7 +75,7 @@ export const INDEXER_DEPOSIT_OBSERVED = 'indexer.deposit.observed'
 
 /** What a caller emits. The envelope's `id`, `occurredAt` and `producer` are added here. */
 export interface DomainEvent {
-  /** `<service>.<aggregate>.<past-tense-verb>` — `wallet.deposit.credited`. */
+  /** `<service>.<aggregate>.<past-tense-verb>` — `wallet.deposit.confirmed`. */
   readonly topic: string
   /** Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp. */
   readonly key: string
@@ -71,6 +85,20 @@ export interface DomainEvent {
   readonly version?: number
 }
 
+/**
+ * The wire version, in the CONTRACT's shape.
+ *
+ * `@cloudsforge/contracts-events` types `EventEnvelope.version` as `${number}.${number}` — a
+ * "major.minor" STRING — and `validateEnvelope` refuses an envelope without one, reporting
+ * "version: missing". This service typed it `number` end to end and sent `1`, so every event it
+ * has ever relayed was rejected at the envelope by every consumer, however correct the signature
+ * was. identity hit the same thing and fixed it the same way (identity/src/outbox.ts:78).
+ *
+ * The stored column stays an integer — storage records the major — and the mapping to the
+ * contract's shape happens here, at the wire, in one place.
+ */
+const wireVersion = (v: number): `${number}.${number}` => `${v}.0` as `${number}.${number}`
+
 /** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
 export interface EventEnvelope {
   readonly id: string
@@ -78,7 +106,7 @@ export interface EventEnvelope {
   readonly key: string
   readonly occurredAt: string
   readonly producer: string
-  readonly version: number
+  readonly version: `${number}.${number}`
   readonly actor: string | null
   readonly correlationId: string | null
   readonly payload: Record<string, unknown>
@@ -225,7 +253,7 @@ export function createRelay(deps: RelayDeps): Handler {
         key: event.key,
         occurredAt: event.occurred_at.toISOString(),
         producer: event.producer,
-        version: event.version,
+        version: wireVersion(event.version),
         actor: event.actor,
         correlationId: event.correlation_id,
         payload: event.payload,

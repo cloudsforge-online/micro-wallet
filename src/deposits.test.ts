@@ -334,7 +334,7 @@ test('a credited deposit emits exactly one event, with a transaction reference',
   const { address } = await assigned()
   await deliver('aaaaaaaa-0000-4000-8000-000000000001', { address })
   const events = await sql<{ topic: string; payload: Record<string, unknown> }[]>`
-    select topic, payload from outbox where topic = 'wallet.deposit.credited'
+    select topic, payload from outbox where topic = 'wallet.deposit.confirmed'
   `
   assert.equal(events.length, 1)
   // The first deposit event in the estate to carry a real transaction hash and an explorer link.
