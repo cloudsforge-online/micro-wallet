@@ -19,8 +19,23 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { Scope } from '@cloudsforge/contracts-auth'
 
-export const PRICING_SCOPES: readonly string[] = Object.freeze(['pricing:read'])
+/**
+ * The scopes this service's token must carry to call pricing.
+ *
+ * `pricing:read` is registered and pricing enforces it (`pricing/src/server.ts:78,492`) — but the
+ * one route this client calls, `GET /rates` (`pricing/src/server.ts:312`), is not gated at all:
+ * the board is public. So this grant is currently WIDER than the call sites need, and it is kept
+ * deliberately rather than emptied, for a reason that belongs to the derivation and not to this
+ * service: `derive-grants.mjs` treats a module that presents a credential and declares NO scope
+ * as an undeclared gap and fails the estate build unless `micro-deploy` carries a hand-written
+ * entry for the file. There is no way to say "this client needs nothing" from the source side.
+ * Reported to micro-deploy; narrow this to `[]` once an empty declaration is expressible.
+ *
+ * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ */
+export const PRICING_SCOPES: readonly Scope[] = Object.freeze(['pricing:read'])
 
 /** No usable price. A conversion refuses; a portfolio renders the holding without a value. */
 export class RateUnavailableError extends Error {

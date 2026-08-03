@@ -26,8 +26,37 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
 import type { ChainId } from './addresses.ts'
+import type { Scope } from '@cloudsforge/contracts-auth'
 
-export const CUSTODY_SCOPES: readonly string[] = Object.freeze(['custody:address'])
+/**
+ * The scopes this service's token must carry to call custody. Named here so the deploy can be
+ * derived from it (`micro-deploy`'s `scripts/derive-grants.mjs`).
+ *
+ * ── IT SAID `custody:address`, AND NO SUCH SCOPE HAS EVER EXISTED ────────────────────────────
+ *
+ * `@cloudsforge/contracts-auth` registers `custody:address:create`, and custody gates the only
+ * route this file calls on exactly that: `ADDRESS_CREATE_SCOPE = 'custody:address:create'`
+ * (`custody/src/server.ts:104`). Both sides were re-read before this line was edited; the
+ * registry is the correct side.
+ *
+ * It never caused an outage, which is the interesting part. The hand-written compose map happened
+ * to grant the right spelling, so the source and the deploy disagreed for the life of the service
+ * and nothing compared them. The moment the deploy was derived FROM this constant instead, the
+ * disagreement became fatal: identity validates its grants against the registry at import and
+ * refuses to start on an unknown name, so this one word would have taken down token minting for
+ * the whole estate.
+ *
+ * ── AND THE ANNOTATION IS THE REAL FIX ───────────────────────────────────────────────────────
+ *
+ * `readonly Scope[]`, not `readonly string[]`. `Scope` is `keyof typeof SCOPES` — the registry
+ * itself — so a scope the registry does not have is a COMPILE ERROR here rather than a boot
+ * failure found by a deploy script months later. Nothing else was looking: `service-ci.yml`'s
+ * scope audit reads a repository's INBOUND route gates, and this is an outbound demand.
+ *
+ * `Scope` still admits a DEPRECATED scope, which identity will not mint either — the registry
+ * exports no live-only type. `scopes.test.ts` covers that at test time.
+ */
+export const CUSTODY_SCOPES: readonly Scope[] = Object.freeze(['custody:address:create'])
 
 export class CustodyUnavailableError extends Error {
   constructor(message: string) {

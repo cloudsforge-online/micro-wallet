@@ -32,9 +32,19 @@ import type {
   EntryMetadata,
   LedgerAssetCode,
 } from '@cloudsforge/contracts-money'
+import type { Scope } from '@cloudsforge/contracts-auth'
 
-/** The scopes this service's token must carry. Named here so the deploy can be derived from it. */
-export const LEDGER_SCOPES: readonly string[] = Object.freeze([
+/**
+ * The scopes this service's token must carry. Named here so the deploy can be derived from it.
+ *
+ * All three are used, one per family of call site: `POST /entries` is gated on
+ * `POST_SCOPE = 'ledger:post'`, `POST /reservations` and `POST /reservations/:id/release` on
+ * `RESERVE_SCOPE = 'ledger:reserve'`, and `GET /accounts/:subject/balances` on
+ * `READ_SCOPE = 'ledger:read'` (`ledger/src/server.ts:78-80, 346, 431, 470, 499`).
+ *
+ * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ */
+export const LEDGER_SCOPES: readonly Scope[] = Object.freeze([
   'ledger:post',
   'ledger:read',
   'ledger:reserve',
