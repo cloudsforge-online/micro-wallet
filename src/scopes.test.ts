@@ -40,10 +40,12 @@
  * empty registry, which is the shape of a check that cannot fail.
  *
  * The compile-time half of this lives in the client headers: each constant is annotated
- * `readonly Scope[]`, so an unregistered name is a type error before it is ever a test failure.
- * This file exists because that annotation is not load-bearing on its own — a future constant
- * written as `readonly string[]` would compile, and the sweep still catches it — and because
- * `Scope` admits DEPRECATED scopes, which identity will not mint either.
+ * `readonly LiveScope[]`, so an unregistered name — or a registered-but-deprecated one — is a
+ * type error before it is ever a test failure. This file exists because that annotation is not
+ * load-bearing on its own: the sweep is name-based and annotation-agnostic, so a FUTURE constant
+ * written as `readonly string[]` compiles happily and is still caught here. The two halves cover
+ * different failures — the annotation catches a bad scope in an annotated constant, this catches
+ * an unannotated constant — and neither subsumes the other.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -214,7 +216,9 @@ test('…and one identity would actually mint: no demand is a deprecated scope',
   }
   // `Scope` cannot express this: it is `keyof typeof SCOPES` and every deprecated key is still a
   // key, deliberately, because removing one narrows the type and breaks twenty-two consumers
-  // (AD-02). Closing this at compile time needs contracts-auth to export a live-only union.
+  // (AD-02). `LiveScope` can, and the outbound constants in this repository now carry it — so for
+  // an ANNOTATED constant this test is a second opinion rather than the only one. It stays because
+  // it also judges constants that are not annotated, which is the case the annotation cannot see.
   assert.deepEqual(dead, [], `a deprecated scope is one identity will not grant:\n  ${dead.join('\n  ')}`)
 })
 

@@ -26,7 +26,7 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
 import type { ChainId } from './addresses.ts'
-import type { Scope } from '@cloudsforge/contracts-auth'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry to call custody. Named here so the deploy can be
@@ -48,15 +48,26 @@ import type { Scope } from '@cloudsforge/contracts-auth'
  *
  * ── AND THE ANNOTATION IS THE REAL FIX ───────────────────────────────────────────────────────
  *
- * `readonly Scope[]`, not `readonly string[]`. `Scope` is `keyof typeof SCOPES` — the registry
- * itself — so a scope the registry does not have is a COMPILE ERROR here rather than a boot
- * failure found by a deploy script months later. Nothing else was looking: `service-ci.yml`'s
- * scope audit reads a repository's INBOUND route gates, and this is an outbound demand.
+ * `readonly LiveScope[]`, not `readonly string[]`. A scope the registry does not have is a
+ * COMPILE ERROR here rather than a boot failure found by a deploy script months later. Nothing
+ * else was looking: `service-ci.yml`'s scope audit reads a repository's INBOUND route gates, and
+ * this is an outbound demand.
  *
- * `Scope` still admits a DEPRECATED scope, which identity will not mint either — the registry
- * exports no live-only type. `scopes.test.ts` covers that at test time.
+ * ── AND WHY `LiveScope` RATHER THAN `Scope` ──────────────────────────────────────────────────
+ *
+ * This annotation first said `Scope`, and it stopped one step short. `Scope` is
+ * `keyof typeof SCOPES` — every registered key, DEPRECATED ones included — so it caught
+ * `custody:address`, which is not a key, and would have waved through `wallet:provision`, which
+ * is. Identity will not mint a deprecated scope either, so the two mistakes end in the same dead
+ * identity container.
+ *
+ * `LiveScope = Exclude<Scope, DeprecatedScope>`, and `DeprecatedScope` is computed FROM `SCOPES`
+ * by a conditional type over the `deprecated` field rather than hand-listed, so it cannot drift
+ * from the registry (`contracts/packages/auth/src/index.ts:507`). `Scope` keeps its wide meaning
+ * on purpose: reading a token is wide, because one may arrive carrying a scope that has since
+ * died; demanding is narrow. This is the demanding direction.
  */
-export const CUSTODY_SCOPES: readonly Scope[] = Object.freeze(['custody:address:create'])
+export const CUSTODY_SCOPES: readonly LiveScope[] = Object.freeze(['custody:address:create'])
 
 export class CustodyUnavailableError extends Error {
   constructor(message: string) {

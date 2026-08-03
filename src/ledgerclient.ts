@@ -32,7 +32,7 @@ import type {
   EntryMetadata,
   LedgerAssetCode,
 } from '@cloudsforge/contracts-money'
-import type { Scope } from '@cloudsforge/contracts-auth'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry. Named here so the deploy can be derived from it.
@@ -42,9 +42,9 @@ import type { Scope } from '@cloudsforge/contracts-auth'
  * `RESERVE_SCOPE = 'ledger:reserve'`, and `GET /accounts/:subject/balances` on
  * `READ_SCOPE = 'ledger:read'` (`ledger/src/server.ts:78-80, 346, 431, 470, 499`).
  *
- * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
  */
-export const LEDGER_SCOPES: readonly Scope[] = Object.freeze([
+export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze([
   'ledger:post',
   'ledger:read',
   'ledger:reserve',

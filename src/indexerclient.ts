@@ -27,7 +27,7 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
 import type { ChainId } from './addresses.ts'
-import type { Scope } from '@cloudsforge/contracts-auth'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry to call the indexer.
@@ -37,10 +37,10 @@ import type { Scope } from '@cloudsforge/contracts-auth'
  * `GET /v1/addresses/…/activity` goes through `authoriseRead`, which demands
  * `READ_SCOPE = 'indexer:read'` (`:89,727`).
  *
- * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`, where
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`, where
  * the untyped form let a scope that does not exist sit in this repository unnoticed.
  */
-export const INDEXER_SCOPES: readonly Scope[] = Object.freeze(['indexer:read', 'indexer:write'])
+export const INDEXER_SCOPES: readonly LiveScope[] = Object.freeze(['indexer:read', 'indexer:write'])
 
 export class IndexerUnavailableError extends Error {
   constructor(message: string) {

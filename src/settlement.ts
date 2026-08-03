@@ -41,7 +41,7 @@
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { AssetCode, Network } from '@cloudsforge/contracts-chain'
 import type { ChainId } from './addresses.ts'
-import type { Scope } from '@cloudsforge/contracts-auth'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry to call settlement.
@@ -63,9 +63,9 @@ import type { Scope } from '@cloudsforge/contracts-auth'
  * authorisation failure. Declaring it now means the grant arrives with the swap instead of after
  * the incident.
  *
- * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
  */
-export const SETTLEMENT_SCOPES: readonly Scope[] = Object.freeze(['settlement:read'])
+export const SETTLEMENT_SCOPES: readonly LiveScope[] = Object.freeze(['settlement:read'])
 
 /** No usable fee. A withdrawal refuses with 503 rather than being priced by guessing. */
 export class FeeUnavailableError extends Error {

@@ -19,7 +19,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
-import type { Scope } from '@cloudsforge/contracts-auth'
+import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
  * The scopes this service's token must carry to call pricing.
@@ -30,12 +30,21 @@ import type { Scope } from '@cloudsforge/contracts-auth'
  * deliberately rather than emptied, for a reason that belongs to the derivation and not to this
  * service: `derive-grants.mjs` treats a module that presents a credential and declares NO scope
  * as an undeclared gap and fails the estate build unless `micro-deploy` carries a hand-written
- * entry for the file. There is no way to say "this client needs nothing" from the source side.
- * Reported to micro-deploy; narrow this to `[]` once an empty declaration is expressible.
+ * entry for the file. An empty array and a forgotten declaration were the same input, so the
+ * honest answer was unsayable and this service over-declared instead.
  *
- * `readonly Scope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
+ * **Half of that is now fixed, and this line is waiting on the other half.**
+ * `@cloudsforge/contracts-auth` exports `NO_SCOPES_REQUIRED` — a named empty constant that makes
+ * "nothing" a statement rather than an absence. What is still missing is the reader:
+ * `derive-grants.mjs` matches `= Object.freeze(` and would see `= NO_SCOPES_REQUIRED` as no
+ * declaration at all, so switching this line TODAY fails the estate build. The order is
+ * micro-deploy first, then this. Narrow it to `NO_SCOPES_REQUIRED` once that branch has landed —
+ * an over-declaration is a real grant on a real token, and AD-05 says a token carries the least
+ * it can.
+ *
+ * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
  */
-export const PRICING_SCOPES: readonly Scope[] = Object.freeze(['pricing:read'])
+export const PRICING_SCOPES: readonly LiveScope[] = Object.freeze(['pricing:read'])
 
 /** No usable price. A conversion refuses; a portfolio renders the holding without a value. */
 export class RateUnavailableError extends Error {
