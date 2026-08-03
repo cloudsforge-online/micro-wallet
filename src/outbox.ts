@@ -22,6 +22,15 @@
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER as CF_SIGNATURE_HEADER,
+  TOPIC_HEADER,
+  signDelivery,
+  validateEnvelope,
+  type EventEnvelope,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
@@ -97,20 +106,18 @@ export interface DomainEvent {
  * The stored column stays an integer — storage records the major — and the mapping to the
  * contract's shape happens here, at the wire, in one place.
  */
-const wireVersion = (v: number): `${number}.${number}` => `${v}.0` as `${number}.${number}`
+const wireVersion = (v: number): EventVersion => `${v}.0`
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
-export interface EventEnvelope {
-  readonly id: string
-  readonly topic: string
-  readonly key: string
-  readonly occurredAt: string
-  readonly producer: string
-  readonly version: `${number}.${number}`
-  readonly actor: string | null
-  readonly correlationId: string | null
-  readonly payload: Record<string, unknown>
-}
+/**
+ * The wire envelope is `@cloudsforge/contracts-events`' — re-exported, not redeclared.
+ *
+ * A hand-rolled copy is the drift the contract package exists to prevent, and the estate has just
+ * paid for it: `market`, `trade`, `community` and `devplatform` were all stamping the wire
+ * `version` as an INTEGER where `EventVersion` requires "major.minor", so their events were refused
+ * at the envelope and NEVER DELIVERED TO ANYONE — invisible, because every suite tests against its
+ * own fake bus. Importing the type makes that a compile error rather than a silent nothing.
+ */
+export type { EventEnvelope } from '@cloudsforge/contracts-events'
 
 export type Emit = (event: DomainEvent) => void
 
@@ -162,6 +169,14 @@ export async function writeEvent(tx: Tx, producer: string, event: DomainEvent): 
 
 /* ------------------------------------------------------------------------ signing */
 
+/**
+ * INBOUND ONLY, and deliberately unchanged.
+ *
+ * `sha256=<hex>` under `x-cloudsforge-signature` is what micro-indexer signs its deposit-confirmed
+ * webhook with (`server.ts:825`). Outbound delivery has moved to the contract's scheme — see the
+ * relay below — but this side of the wire is the OTHER end's format, and changing it here would
+ * simply stop accepting indexer's events. It moves when indexer moves, not before.
+ */
 const SIGNATURE_HEADER = 'x-cloudsforge-signature'
 
 /** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
@@ -178,6 +193,41 @@ export function verifyEventSignature(body: string, secret: string, presented: st
 }
 
 /* ------------------------------------------------------------------------ relay */
+
+/**
+ * An outbox row, as the contract's envelope — or the reasons it is not one.
+ *
+ * The stored row is looser than the wire: `actor` and `correlation_id` are nullable columns and
+ * `topic` and `producer` are free text, while `EventEnvelope` requires an `Actor`, a non-null
+ * `correlationId`, a registered `TopicName` and a known `ProducerService`. Rather than cast that
+ * gap away, this builds the envelope and hands it to the CONTRACT'S OWN `validateEnvelope`, so the
+ * relay's idea of a valid event and a subscriber's are the same function.
+ *
+ * `system` for a missing actor is the contract's own value for "no principal did this" — a
+ * scheduled sweep or a reconciliation — which is exactly what a null actor column means here.
+ * A missing correlation id falls back to the event id: an id that ties the event to itself is
+ * weaker than one that ties it to the request, but it is never absent, and an absent one is where
+ * a cross-service investigation stops.
+ */
+function buildEnvelope(
+  row: OutboxRow,
+): { ok: true; value: EventEnvelope } | { ok: false; defects: readonly string[] } {
+  const candidate = {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? 'system',
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
+  const verdict = validateEnvelope(candidate)
+  return verdict.ok
+    ? { ok: true, value: verdict.value }
+    : { ok: false, defects: verdict.errors }
+}
 
 export interface RelayDeps {
   readonly sql: Db
@@ -247,20 +297,38 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: wireVersion(event.version),
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
+      const built = buildEnvelope(event)
+      if (!built.ok) {
+        // REFUSED HERE RATHER THAN SENT. An envelope the contract rejects is one every subscriber
+        // rejects, so relaying it burns a retry budget delivering something nobody can accept —
+        // and `market`, `trade`, `community` and `devplatform` all shipped exactly that for weeks
+        // without noticing, because their suites verified against their own fake buses.
+        //
+        // Logged and SKIPPED, not published: the row stays unpublished so the defect is visible in
+        // the backlog and is delivered once whatever produced it is fixed, rather than being
+        // silently marked done.
+        deps.logger.error('outbox row is not a valid envelope; not relayed', {
+          eventId: event.id,
+          topic: event.topic,
+          defects: built.defects,
+        })
+        continue
       }
+      const envelope = built.value
+      // THE CONTRACT'S SCHEME, not a local one: `t=<seconds>,v1=<hmac over "seconds.body">`.
+      //
+      // This relay used to roll its own `sha256=<hex>`, which is the drift `@cloudsforge/contracts-
+      // events` exists to prevent — and it had a live cost: micro-settlement had migrated to the
+      // contract and was carrying a second inbound arm purely to keep accepting wallet's events.
+      // That arm can now be retired.
+      //
+      // The timestamp is INSIDE the signed message rather than beside it, so it cannot be moved
+      // without invalidating the signature, which is what makes a subscriber's freshness window
+      // mean anything — the old scheme had no timestamp at all and no replay bound.
+      //
       // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with
       // the same key order, so the MAC a subscriber recomputes over the received body matches.
-      const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
+      const signature = signDelivery(JSON.stringify(envelope), deps.signingSecret)
 
       for (const subscription of subscriptions) {
         await deliver(deps, clientFor, subscription, envelope, signature, deadlineMs)
@@ -328,7 +396,11 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      headers: {
+        [CF_SIGNATURE_HEADER]: signature,
+        [EVENT_ID_HEADER]: envelope.id,
+        [TOPIC_HEADER]: envelope.topic,
+      },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`

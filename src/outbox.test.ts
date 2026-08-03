@@ -4,6 +4,14 @@ import type postgres from 'postgres'
 import type { HttpClient, RequestOptions } from '@cloudsforge/http'
 import type { Job } from '@cloudsforge/jobs'
 import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  TOPIC_HEADER,
+  classifyEnvelope,
+  verifyDelivery,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
+import {
   DEPOSIT_ADDRESS_ASSIGNED,
   DEPOSIT_CREDITED,
   INDEXER_DEPOSIT_CONFIRMED,
@@ -213,13 +221,28 @@ test('the relay signs the exact bytes and keys the POST idempotently', { skip },
   // the subscriber dedupes on.
   assert.equal(call.options.idempotencyKey, envelope.id)
   assert.equal(call.options.requestId, 'req-9')
+  // THE CONTRACT'S SCHEME, verified with the CONTRACT'S OWN verifier.
+  //
+  // This assertion used to call this file's `verifyEventSignature` against this file's `signEvent`
+  // under `x-cloudsforge-signature` — a test that could only ever confirm the relay agreed with
+  // itself. It passed for months while micro-settlement carried a second inbound arm purely to
+  // keep accepting these deliveries. Checking with `verifyDelivery` is what makes it an assertion
+  // about the estate rather than about this file.
+  const presented = call.options.headers?.[SIGNATURE_HEADER] ?? ''
+  assert.match(presented, /^t=\d+,v1=[0-9a-f]+$/, 'the contract scheme carries a timestamp')
+  assert.equal(verifyDelivery(JSON.stringify(envelope), presented, SECRET).ok, true)
+  assert.equal(call.options.headers?.[EVENT_ID_HEADER], envelope.id)
+  assert.equal(call.options.headers?.[TOPIC_HEADER], envelope.topic)
+  // And the retired header is gone, so a subscriber cannot keep a legacy arm alive by accident.
+  assert.equal(call.options.headers?.['x-cloudsforge-signature'], undefined)
+  assert.equal(call.options.headers?.['x-event-id'], undefined)
+
+  // A tampered body must not verify. Without this the assertion above passes for a verifier that
+  // returns true unconditionally.
   assert.equal(
-    verifyEventSignature(
-      JSON.stringify(envelope),
-      SECRET,
-      call.options.headers?.['x-cloudsforge-signature'] ?? '',
-    ),
-    true,
+    verifyDelivery(`${JSON.stringify(envelope)} `, presented, SECRET).ok,
+    false,
+    'a modified body must not verify',
   )
 })
 
@@ -299,4 +322,75 @@ test('the same id under a different topic is not a duplicate', { skip }, async (
   await withInbox(db(), 'topic.a.b', EVENT_ID, async () => 1)
   const other = await withInbox(db(), 'topic.c.d', EVENT_ID, async () => 1)
   assert.equal(other.status, 'processed')
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * THE GUARD FOR THE WHOLE DEFECT CLASS.
+ *
+ * `market`, `trade`, `community` and `devplatform` each stamped the wire `version` as an INTEGER
+ * where `EventVersion` requires "major.minor". Every event they produced was refused at the
+ * envelope and NEVER DELIVERED TO ANYONE — for weeks, invisibly, because every suite in the estate
+ * verifies against its own fake bus, which accepts whatever the producer happens to send.
+ *
+ * The only check that catches that is one where the RELAY'S OWN envelope meets the CONTRACT'S OWN
+ * validator. Both halves matter: a test that builds its own envelope proves nothing about what the
+ * relay sends, and a test that checks the relay's envelope against a local expectation proves only
+ * that the relay agrees with itself.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('every envelope the relay produces satisfies the CONTRACT, not a local expectation', { skip }, async () => {
+  // The subscription first: with nobody listening the row is published without ever being built
+  // into an envelope, and this test would pass by relaying nothing.
+  await sql`
+    insert into event_subscriptions (topic, url)
+    values (${WITHDRAWAL_REQUESTED}, 'http://settlement.test/events')
+  `
+  await withOutbox(db(), 'wallet', async (_tx, emit) => {
+    emit({
+      topic: WITHDRAWAL_REQUESTED,
+      key: 'w-envelope',
+      payload: { withdrawalId: 'w-envelope' },
+      actor: 'user:11111111-1111-7111-8111-111111111111',
+      correlationId: 'req-envelope',
+    })
+    // A SECOND event with no actor and no correlation id — the nullable columns. Those are the
+    // rows the contract's envelope has no room for, and the ones a cast would have smuggled
+    // through as `null` for a subscriber to reject.
+    emit({ topic: WITHDRAWAL_REQUESTED, key: 'w-envelope-2', payload: { withdrawalId: 'w-2' } })
+  })
+
+  const { clientFor, calls } = stubClient()
+  await createRelay({ sql: db(), logger: quietLogger(), signingSecret: SECRET, clientFor })(relayJob, relayCtx)
+
+  assert.ok(calls.length > 0, 'nothing was relayed, so nothing was checked')
+  for (const call of calls) {
+    // `classifyEnvelope` rather than the `envelopeDefects` wrapper: it gives the verdict and the
+    // reasons together, and the wrapper was buggy until very recently.
+    const verdict = classifyEnvelope(call.options.body)
+    assert.equal(
+      verdict.reason,
+      'valid',
+      `the relay produced an envelope no subscriber can accept: ${JSON.stringify(verdict.defects)}`,
+    )
+  }
+})
+
+test('the version on the wire is "major.minor" — an integer is a COMPILE error', () => {
+  // The type is imported so the mistake cannot reach a test run at all. This line is the assertion:
+  // `const bad: EventVersion = 1` does not compile, which is the whole point of importing it.
+  const good: EventVersion = '1.0'
+  assert.match(good, /^\d+\.\d+$/)
+  // And the validator agrees, so the type and the runtime check cannot drift apart.
+  const withInteger = classifyEnvelope({
+    id: crypto.randomUUID(),
+    topic: 'wallet.withdrawal.requested',
+    key: 'user:1',
+    occurredAt: new Date().toISOString(),
+    producer: 'wallet',
+    version: 1,
+    actor: 'system',
+    correlationId: 'req-1',
+    payload: {},
+  })
+  assert.notEqual(withInteger.reason, 'valid', 'an integer version must be refused at the envelope')
 })
