@@ -84,6 +84,26 @@ function optional(source: Source, name: string, fallback: string): string {
   return value && value.length > 0 ? value : fallback
 }
 
+/**
+ * A secret that may be absent, but must be real if present.
+ *
+ * The distinction matters for the identity credential: absent is a deployment that has not been
+ * given one yet and is reported by `/readyz`; a 20-character placeholder is a deployment that
+ * believes it HAS one, and would fail on its first call to a peer with a 401 that reads as
+ * "identity rejected wallet" rather than "nobody set this variable".
+ */
+function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+  const value = source[name]?.trim()
+  if (!value) return null
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+  }
+  if (value.length < minLength) {
+    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  }
+  return value
+}
+
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
   const raw = source[name]?.trim()
   if (!raw) return fallback
@@ -128,18 +148,56 @@ export interface Env {
    */
   readonly network: Network
 
-  /** Where the ledger is, and the service token this service presents to it. */
+  /** Where the ledger is, and the peers this service presents a token to. */
   readonly ledgerUrl: string
   readonly custodyUrl: string
   readonly indexerUrl: string
   readonly pricingUrl: string
+
   /**
-   * The token this service presents to its peers.
+   * Where identity is, for `POST /service-tokens/exchange`.
    *
-   * One token, not four: it is minted for `service:wallet` with the scopes wallet needs, and the
-   * peers each check the scope they care about. Four tokens would be four rotations.
+   * Defaults to `IDENTITY_ISSUER`, which is already required and is identity's own base URL — the
+   * issuer of a token is by definition where the token came from. `IDENTITY_URL` overrides it for
+   * a deployment where the two genuinely differ (an issuer behind a public name, dialled
+   * internally). Deriving rather than demanding a fourth identity variable keeps the two in step:
+   * a deployment that pointed the exchange at one identity and trusted the JWKS of another would
+   * fail with a signature error nobody would read as a configuration mistake.
    */
-  readonly serviceToken: string
+  readonly identityUrl: string
+
+  /**
+   * **The long-lived credential this service exchanges for short-lived tokens.**
+   *
+   * It replaces `WALLET_SERVICE_TOKEN`, which was a 600-second token read once at boot. Ten
+   * minutes into any deployment it expired and every call to a peer failed; nothing could re-mint
+   * it, because minting requires the `admin` role. A credential is not a token: it confers nothing
+   * by itself, it is revocable, and it survives a restart. See `micro-identity`
+   * `src/serviceCredentials.ts` and `@cloudsforge/auth` `ServiceTokenProvider`.
+   *
+   * OPTIONAL, AND THAT IS DELIBERATE — but it is not "unconfigured is fine". Everything this
+   * service does that touches money crosses a service boundary, so a wallet with no credential can
+   * serve almost nothing. It is optional because it must be possible to BOOT the image without
+   * one: the CI startup smoke test builds the container, migrates it and reads `/livez`, and that
+   * job's environment is fixed in a workflow file. Making this `requiredSecret` would fail that
+   * job rather than this service.
+   *
+   * The absence is therefore not silent. `/readyz` reports the `identity-credential` probe as a
+   * HARD failure, so an unconfigured replica never takes traffic, and every upstream call fails
+   * closed with 503 rather than being sent unauthenticated. Contrast the soft upstream probes: a
+   * missing credential is a deployment that is wrong and will stay wrong, not a peer having a bad
+   * minute.
+   */
+  readonly identityCredential: string | null
+
+  /**
+   * Whether the retired `WALLET_SERVICE_TOKEN` is still set.
+   *
+   * Read for exactly one purpose: to say so at boot. An operator who redeploys with the old
+   * variable and not the new one would otherwise get a service that looks configured and is not,
+   * which is a slower version of the defect the credential was introduced to fix.
+   */
+  readonly legacyServiceTokenPresent: boolean
 
   /** Absolute wall-clock ceiling on one outbound call, retries included. */
   readonly upstreamDeadlineMs: number
@@ -258,7 +316,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     custodyUrl: required(source, 'CUSTODY_URL'),
     indexerUrl: required(source, 'INDEXER_URL'),
     pricingUrl: required(source, 'PRICING_URL'),
-    serviceToken: requiredSecret(source, 'WALLET_SERVICE_TOKEN'),
+    identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
+    // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is a
+    // check that can fail, rather than by a boot that CI cannot perform.
+    identityCredential: optionalSecret(source, 'WALLET_IDENTITY_CREDENTIAL'),
+    legacyServiceTokenPresent: (source['WALLET_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     upstreamDeadlineMs: integer(source, 'WALLET_UPSTREAM_DEADLINE_MS', 8_000, 250, 60_000),
     challengeTtlSeconds: integer(source, 'WALLET_CHALLENGE_TTL_SECONDS', 600, 30, 3_600),
     challengeDomain: required(source, 'WALLET_CHALLENGE_DOMAIN'),

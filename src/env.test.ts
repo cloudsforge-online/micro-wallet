@@ -18,11 +18,17 @@ const BASE: Record<string, string> = {
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4006',
   PRICING_URL: 'http://127.0.0.1:4007',
-  WALLET_SERVICE_TOKEN: 'a-service-token-long-enough-to-pass',
   WALLET_CHALLENGE_DOMAIN: 'hub.cloudsforge.online',
   WALLET_CHALLENGE_URI: 'https://hub.cloudsforge.online/wallets/verify',
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
+
+/**
+ * The credential is NOT in `BASE`, because it is not required — see the field comment in `env.ts`.
+ * `WALLET_SERVICE_TOKEN` is not there either: it was removed, and the tests below assert that its
+ * absence is fine and its presence is reported rather than silently obeyed.
+ */
+const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
 
 const { EnvError, SERVICE, env: eager, loadEnv, parseFeeQuotes } = await import('./env.ts')
 
@@ -54,6 +60,47 @@ test('a missing variable names itself', () => {
       `${name} did not name itself`,
     )
   }
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * The credential that replaced WALLET_SERVICE_TOKEN. See `env.ts` and `@cloudsforge/auth`.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+test('the identity credential is read, and its absence is a null rather than a throw', () => {
+  assert.equal(loadEnv({ ...BASE, WALLET_IDENTITY_CREDENTIAL: CREDENTIAL }).identityCredential, CREDENTIAL)
+  // Absent must LOAD — the image has to boot without one so the CI smoke test can read /livez —
+  // and is caught by the hard `identity-credential` readiness probe instead.
+  assert.equal(loadEnv(BASE).identityCredential, null)
+})
+
+test('a credential that is present but too short is refused, not accepted as configured', () => {
+  // Absent is a deployment nobody has given a credential to. A short one is a deployment that
+  // BELIEVES it has one, and would fail on its first call to a peer with a 401 that reads as
+  // "identity rejected wallet" rather than "nobody set this variable".
+  assert.throws(
+    () => loadEnv({ ...BASE, WALLET_IDENTITY_CREDENTIAL: 'cfsc_short' }),
+    (err: unknown) => err instanceof EnvError && err.message.includes('WALLET_IDENTITY_CREDENTIAL'),
+  )
+})
+
+test('identityUrl derives from the issuer, and IDENTITY_URL overrides it', () => {
+  // The issuer of a token is by definition where the token came from, so demanding a fourth
+  // identity variable would only create a way for the exchange and the JWKS to disagree.
+  assert.equal(loadEnv(BASE).identityUrl, BASE['IDENTITY_ISSUER'])
+  assert.equal(
+    loadEnv({ ...BASE, IDENTITY_URL: 'http://identity.internal:4000' }).identityUrl,
+    'http://identity.internal:4000',
+  )
+})
+
+test('WALLET_SERVICE_TOKEN is no longer required, and being set is reported rather than obeyed', () => {
+  // The retired variable. It was a 600-second token read once at boot; ten minutes into every
+  // deployment every call to a peer failed and nothing could re-mint it.
+  assert.equal(loadEnv(BASE).legacyServiceTokenPresent, false)
+  const withLegacy = loadEnv({ ...BASE, WALLET_SERVICE_TOKEN: 'a-service-token-long-enough-to-pass' })
+  assert.equal(withLegacy.legacyServiceTokenPresent, true)
+  // And it confers nothing: setting it must not make the service look configured.
+  assert.equal(withLegacy.identityCredential, null)
 })
 
 test('a known placeholder secret is refused outright', () => {

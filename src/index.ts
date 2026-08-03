@@ -18,17 +18,14 @@
 import postgres from 'postgres'
 import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
-import { Verifier } from '@cloudsforge/auth'
+import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { SERVICE, env } from './env.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
-import { httpCustodyClient } from './custodyclient.ts'
-import { httpIndexerClient } from './indexerclient.ts'
-import { httpLedgerClient } from './ledgerclient.ts'
-import { httpPricingClient } from './pricingclient.ts'
+import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
 import { pendingCredits, type DepositDeps } from './deposits.ts'
 import { unwatchedAssignments } from './deposits.ts'
@@ -81,34 +78,47 @@ try {
   process.exit(1)
 }
 
-// 5. The upstreams. Built before the Lifecycle so the probes can close over their URLs, and
-//    before the stores because every store takes one.
-//
-//    One service token for all four peers, refreshed through a function rather than captured as a
-//    string: `HttpClient` calls it per request, so a short-TTL token can be rotated without a
-//    restart when identity starts minting them.
-const token = () => env.serviceToken
-const ledger = httpLedgerClient({
-  baseUrl: env.ledgerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
+// 5. The upstreams, and the credential that authenticates every call to them. Built before the
+//    Lifecycle so the probes can close over them, and before the stores because every store takes
+//    one. The wiring itself lives in `./upstreams.ts` and is covered by `servicetoken.test.ts` —
+//    it was untestable here, and what was untestable here was wrong for months. See that file.
+const { identityTokens, ledger, custody, indexer, pricing } = buildUpstreams(env, {
   originatingService: SERVICE,
+  onEvent: (event) => {
+    if (event.kind === 'exchange_failed') {
+      // `warn`, not `error`, while a usable token is still held: the 20% slack after the refresh
+      // point exists precisely so a few of these are survivable and uninteresting.
+      const level = event.hadUsableToken ? 'warn' : 'error'
+      logger[level]('service token exchange failed', {
+        err: event.err,
+        hadUsableToken: event.hadUsableToken,
+      })
+    } else if (event.kind === 'minted') {
+      logger.info('service token minted', {
+        service: event.service,
+        expiresIn: event.expiresIn,
+        refreshInMs: event.refreshInMs,
+      })
+    } else {
+      logger.warn('service token', { event: event.kind, url: event.url })
+    }
+  },
 })
-const custody = httpCustodyClient({
-  baseUrl: env.custodyUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const indexer = httpIndexerClient({
-  baseUrl: env.indexerUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
-const pricing = httpPricingClient({
-  baseUrl: env.pricingUrl,
-  token,
-  deadlineMs: env.upstreamDeadlineMs,
-})
+
+if (!identityTokens) {
+  // Not `fatal` and exit: the image must be able to boot without this so CI's startup smoke test
+  // can read /livez, and a service that refuses to start is a service whose logs nobody reads.
+  // `/readyz` is where the absence is enforced — the `identity-credential` probe below is hard,
+  // so an unconfigured replica takes no traffic.
+  logger.error('WALLET_IDENTITY_CREDENTIAL is not set; every call to a peer will fail 503', {
+    hint: 'deploy/scripts/estate-bootstrap.sh writes it to compose/estate/tokens.env',
+  })
+}
+if (env.legacyServiceTokenPresent) {
+  logger.error('WALLET_SERVICE_TOKEN is set and is IGNORED', {
+    hint: 'it was a 600-second token read once at boot; WALLET_IDENTITY_CREDENTIAL replaces it',
+  })
+}
 
 // 6. The Lifecycle and its probes, before the routes, because `/readyz` is a route and it needs
 //    something to report. The service is `starting` from here until `markReady()`.
@@ -142,6 +152,12 @@ lifecycle
   // 503 and say which upstream did not answer, which is a better answer than an unroutable
   // service.
   .addProbe(httpProbe('identity-jwks', env.identityJwksUrl, { kind: 'soft' }))
+  // HARD, and the only hard probe here besides the database. Unlike the three below, this does not
+  // report a peer having a bad minute — it fails only when no credential is configured at all,
+  // which is a deployment that cannot serve a single money route and will not fix itself. An
+  // identity OUTAGE returns warn, deliberately, so one bad minute in identity does not empty every
+  // balancer in the estate at once.
+  .addProbe(serviceTokenProbe(identityTokens))
   .addProbe(httpProbe('ledger', `${env.ledgerUrl}/livez`, { kind: 'soft' }))
   .addProbe(httpProbe('indexer', `${env.indexerUrl}/livez`, { kind: 'soft' }))
 
