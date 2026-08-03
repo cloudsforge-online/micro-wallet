@@ -2,6 +2,8 @@
 
 The user-facing money API for CloudsForge.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 **It owns no balances — the ledger does. It owns no keys — custody does. It orchestrates.**
 
 That sentence is the whole design, and it is enforced rather than asserted:
@@ -97,3 +99,10 @@ There is no signing in this service and there never will be.
 * **Watching the chain.** That is the indexer. AD-07, and the reason deposits here carry real
   transaction hashes for the first time in the estate.
 * **Holding keys.** That is custody. §3.3.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
