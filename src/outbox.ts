@@ -21,10 +21,9 @@
  * measured conditions under which that stops being true.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
 import {
   EVENT_ID_HEADER,
-  SIGNATURE_HEADER as CF_SIGNATURE_HEADER,
+  SIGNATURE_HEADER,
   TOPIC_HEADER,
   signDelivery,
   validateEnvelope,
@@ -169,28 +168,33 @@ export async function writeEvent(tx: Tx, producer: string, event: DomainEvent): 
 
 /* ------------------------------------------------------------------------ signing */
 
-/**
- * INBOUND ONLY, and deliberately unchanged.
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE LEGACY MAC IS GONE FROM THIS REPOSITORY, IN BOTH DIRECTIONS. NOTHING HERE CAN MINT ONE.
  *
- * `sha256=<hex>` under `x-cloudsforge-signature` is what micro-indexer signs its deposit-confirmed
- * webhook with (`server.ts:825`). Outbound delivery has moved to the contract's scheme — see the
- * relay below — but this side of the wire is the OTHER end's format, and changing it here would
- * simply stop accepting indexer's events. It moves when indexer moves, not before.
+ * `signEvent` and `verifyEventSignature` lived here — `sha256=<hex>` over the body under
+ * `x-cloudsforge-signature` — and this file's header used to say the inbound half was
+ * "deliberately unchanged… it moves when indexer moves, not before". Indexer moved. So did
+ * settlement, ledger and identity: all four sign with the contract's `signDelivery` under
+ * `cf-signature`, and this service was the last verifier of the old scheme in the estate.
+ *
+ * **What that cost was measured, not inferred.** Against the running estate, a correctly
+ * contract-signed `POST /events` carrying a real deposit envelope answered `401 bad_signature`,
+ * while the legacy MAC answered 200 — so every deposit confirmation, every settlement outcome and
+ * every event any producer has sent this service since they migrated was refused, and the relays
+ * have been retrying them ever since. The intake looked healthy the whole time.
+ *
+ * **No legacy arm was kept, and that is the deliberate part.** `micro-settlement` kept one and
+ * metered it, which is defensible where producers remain on the old scheme. None remain here.
+ * The old MAC covers the body ALONE with no timestamp, so a captured POST to an intake that
+ * CREDITS MONEY stays valid for ever — the same permanent replay credential `micro-admin-api`
+ * removed from its audit intake tonight. An arm with no producer to serve is that credential kept
+ * alive for nobody, and `verifyDelivery`'s freshness window is the whole reason to move.
+ *
+ * The functions are deleted rather than left unexported so that nothing in this repository —
+ * including a test — can produce the old signature. `outbox.test.ts` pins that absence.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
-
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
-export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
-}
-
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
-export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
-}
 
 /* ------------------------------------------------------------------------ relay */
 
@@ -397,7 +401,7 @@ async function deliver(
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
       headers: {
-        [CF_SIGNATURE_HEADER]: signature,
+        [SIGNATURE_HEADER]: signature,
         [EVENT_ID_HEADER]: envelope.id,
         [TOPIC_HEADER]: envelope.topic,
       },

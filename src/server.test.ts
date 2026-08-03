@@ -1,5 +1,6 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHmac } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import type postgres from 'postgres'
@@ -8,7 +9,12 @@ import { AUDIENCE, Verifier } from '@cloudsforge/auth'
 import { Lifecycle, type Probe } from '@cloudsforge/lifecycle'
 import { Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import { depositCreditKey } from './deposits.ts'
-import { INDEXER_DEPOSIT_CONFIRMED, signEvent } from './outbox.ts'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  signDelivery,
+} from '@cloudsforge/contracts-events'
+import { INDEXER_DEPOSIT_CONFIRMED } from './outbox.ts'
 import { MONEY_SCOPE, READ_SCOPE, WRITE_SCOPE, createServer, registerServiceMetrics } from './server.ts'
 import { SETTLEMENT_CONFIRMED } from './settlement.ts'
 import {
@@ -450,14 +456,22 @@ test('a managed wallet cannot be created through the registration route', { skip
 
 /* ------------------------------------------------------------------ event intake */
 
+/**
+ * Deliver as a producer's relay does: the CONTRACT's `signDelivery` under `cf-signature`.
+ *
+ * This used to sign with a local `sha256=<hex>` under `x-cloudsforge-signature`, agreeing with an
+ * intake that no producer in the estate could talk to — a round trip between two copies of the
+ * same drift. Signing here the way `contracts-events` signs is what makes these assertions say
+ * anything about deliverability.
+ */
 const deliverEvent = async (rig: Rig, envelope: Record<string, unknown>, secret = SECRET) => {
   const body = JSON.stringify(envelope)
   return fetch(`${rig.url}/events`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-cloudsforge-signature': signEvent(body, secret),
-      'x-event-id': String(envelope['id']),
+      [SIGNATURE_HEADER]: signDelivery(body, secret),
+      [EVENT_ID_HEADER]: String(envelope['id']),
     },
     body,
   })
@@ -509,6 +523,73 @@ test('an event with a bad signature is 401 and never reaches the crediting path'
     )
     assert.equal(res.status, 401)
     assert.equal((await sql`select 1 from inbox`).length, 0, 'the body must not have been acted on')
+  })
+})
+
+test('THE RULE: the bytes verified are the bytes acted on', { skip }, async () => {
+  // Sign one string, deliver another differing by a single byte. This is the failure a
+  // verify-then-reparse implementation cannot detect: it authenticates what the producer sent and
+  // then credits what the attacker sent. `readRaw` decodes once and `handleEvent` hands the same
+  // string to `verifyDelivery` and to `JSON.parse`, so the tampered body is refused at the door.
+  await withServer({}, async (rig) => {
+    const assigned = await fetch(`${rig.url}/v1/deposits`, {
+      method: 'POST',
+      headers: asUser(),
+      body: JSON.stringify({ assetCode: 'EMBER' }),
+    })
+    const { assignment } = (await assigned.json()) as { assignment: { address: string } }
+    const signed = JSON.stringify({
+      id: 'cccccccc-0000-4000-8000-000000000001',
+      topic: INDEXER_DEPOSIT_CONFIRMED,
+      key: 'ember:testnet',
+      payload: depositPayload({ address: assignment.address }),
+    })
+    // One byte: a trailing space. Same JSON, same credit, different bytes.
+    const delivered = `${signed} `
+    assert.notEqual(signed, delivered)
+    assert.deepEqual(JSON.parse(delivered), JSON.parse(signed), 'the tamper must be invisible to a parser')
+
+    const res = await fetch(`${rig.url}/events`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [SIGNATURE_HEADER]: signDelivery(signed, SECRET),
+        [EVENT_ID_HEADER]: 'cccccccc-0000-4000-8000-000000000001',
+      },
+      body: delivered,
+    })
+    assert.equal(res.status, 401)
+    assert.equal((await sql`select 1 from inbox`).length, 0, 'nothing may have been acted on')
+    assert.equal((await sql`select 1 from deposit_credits`).length, 0, 'no money may have moved')
+    assert.equal(h.ledger.entries.length, 0)
+  })
+})
+
+test('the retired body-only MAC is refused, so it is not a standing forgery credential', { skip }, async () => {
+  // `sha256=<hmac over the body>` under `x-cloudsforge-signature` is what this intake used to
+  // accept, and it carried no timestamp — a captured POST to a route that credits money stayed
+  // valid for ever. No producer signs it any more, so accepting it would preserve the credential
+  // for nobody. Asserted at the WIRE rather than by grepping the source: this is the property.
+  await withServer({}, async (rig) => {
+    const body = JSON.stringify({
+      id: 'dddddddd-0000-4000-8000-000000000001',
+      topic: INDEXER_DEPOSIT_CONFIRMED,
+      payload: depositPayload(),
+    })
+    const legacy = `sha256=${createHmac('sha256', SECRET).update(body).digest('hex')}`
+    for (const headers of [
+      { 'x-cloudsforge-signature': legacy },
+      // And under the contract's header too, in case the scheme is smuggled across.
+      { [SIGNATURE_HEADER]: legacy },
+    ]) {
+      const res = await fetch(`${rig.url}/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body,
+      })
+      assert.equal(res.status, 401, `the legacy MAC was accepted under ${Object.keys(headers)[0]}`)
+    }
+    assert.equal((await sql`select 1 from inbox`).length, 0)
   })
 })
 

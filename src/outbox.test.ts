@@ -1,5 +1,8 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type postgres from 'postgres'
 import type { HttpClient, RequestOptions } from '@cloudsforge/http'
 import type { Job } from '@cloudsforge/jobs'
@@ -8,6 +11,7 @@ import {
   SIGNATURE_HEADER,
   TOPIC_HEADER,
   classifyEnvelope,
+  signDelivery,
   verifyDelivery,
   type EventVersion,
 } from '@cloudsforge/contracts-events'
@@ -22,8 +26,6 @@ import {
   WITHDRAWAL_REQUESTED,
   WITHDRAWAL_STUCK,
   createRelay,
-  signEvent,
-  verifyEventSignature,
   withInbox,
   withOutbox,
   type Db,
@@ -91,13 +93,48 @@ test('every topic obeys the registry’s shape rule', () => {
 })
 
 test('a signature verifies, and one byte of tampering does not', () => {
+  // The CONTRACT's scheme, not a local one. This used to exercise this file's own `signEvent`
+  // against this file's own `verifyEventSignature` — a round trip that would have agreed just as
+  // happily if both ends had drifted away from every other service in the estate, which is
+  // precisely what had happened.
   const body = JSON.stringify({ id: 'e-1', topic: DEPOSIT_CREDITED })
-  const signature = signEvent(body, SECRET)
-  assert.equal(verifyEventSignature(body, SECRET, signature), true)
-  assert.equal(verifyEventSignature(`${body} `, SECRET, signature), false)
-  assert.equal(verifyEventSignature(body, 'a-different-secret-entirely-32ch', signature), false)
-  assert.equal(verifyEventSignature(body, SECRET, `sha256=${'0'.repeat(64)}`), false)
-  assert.equal(verifyEventSignature(body, SECRET, 'short'), false, 'a length mismatch must not throw')
+  const signature = signDelivery(body, SECRET)
+  const verdict = (b: string, header: string, secret = SECRET): string => {
+    const result = verifyDelivery(b, header, secret)
+    return result.ok ? 'ok' : result.reason
+  }
+  assert.equal(verdict(body, signature), 'ok')
+  assert.equal(verdict(`${body} `, signature), 'mismatch')
+  assert.equal(verdict(body, signature, 'a-different-secret-entirely-32ch'), 'mismatch')
+  assert.equal(verdict(body, 'short'), 'malformed_header')
+  // The property the old scheme could not have: the timestamp is inside the signed message, so a
+  // captured delivery stops being a credential. `sha256=<hmac over the body>` never expired.
+  assert.equal(verdict(body, signDelivery(body, SECRET, Date.now() - 3_600_000)), 'stale')
+})
+
+test('nothing in this repository can mint the retired body-only MAC', () => {
+  // A guard on an ABSENCE, so it is written to fail on the thing itself rather than on prose
+  // about it: comments are stripped first, because a check that its own explanation satisfies is
+  // a check that has already stopped working.
+  const stripped = (text: string): string =>
+    text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const offenders: string[] = []
+  const dir = fileURLToPath(new URL('.', import.meta.url))
+  const files = readdirSync(dir).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+  assert.ok(files.length > 20, `swept ${files.length} source files; the sweep is broken, not the tree`)
+  for (const file of files) {
+    const source = stripped(readFileSync(join(dir, file), 'utf8'))
+    if (/sha256=/.test(source)) offenders.push(`${file}: builds or matches a 'sha256=' MAC`)
+    if (/x-cloudsforge-signature/.test(source)) offenders.push(`${file}: names the legacy header`)
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `the legacy MAC covers the body with no timestamp, so a captured POST to the crediting intake is a permanent forgery credential:\n  ${offenders.join('\n  ')}`,
+  )
+  // The guard can fail. Without this, a regex that matched nothing would look identical.
+  assert.match(stripped("const legacy = `sha256=${mac}`"), /sha256=/)
+  assert.doesNotMatch(stripped('// sha256=deadbeef'), /sha256=/)
 })
 
 /* ------------------------------------------------------------------ atomicity */

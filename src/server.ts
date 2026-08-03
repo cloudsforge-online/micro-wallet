@@ -80,7 +80,12 @@ import {
   type Authorisation,
 } from './links.ts'
 import { convert, MoneyError, spend, transfer, type MoneyDeps } from './money.ts'
-import { INDEXER_DEPOSIT_CONFIRMED, verifyEventSignature } from './outbox.ts'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  verifyDelivery,
+} from '@cloudsforge/contracts-events'
+import { INDEXER_DEPOSIT_CONFIRMED } from './outbox.ts'
 import { readPortfolio, type PortfolioDeps } from './portfolio.ts'
 import { SETTLEMENT_CONFIRMED, SETTLEMENT_FAILED } from './settlement.ts'
 import {
@@ -810,9 +815,30 @@ function buildRoutes(): Route[] {
 /**
  * The event intake.
  *
- * Authenticated by the HMAC the producing service's relay put on the exact bytes it sent, and
+ * Authenticated by the MAC the producing service's relay put on the exact bytes it sent, and
  * **verified before the body is parsed**. That ordering is the point: an unauthenticated body
- * never reaches a JSON parser, let alone the crediting path.
+ * never reaches a JSON parser, let alone the crediting path. `readRaw` decodes the request ONCE
+ * and the same string is handed to `verifyDelivery` and to `JSON.parse` — verifying one string
+ * and parsing another is how an implementation drifts towards acting on something other than what
+ * it authenticated.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS READ `x-cloudsforge-signature` AND NOTHING ELSE, AND SO IT REFUSED EVERY PRODUCER.**
+ *
+ * Indexer, settlement, ledger and identity all sign with the contract's `signDelivery` —
+ * `t=<seconds>,v1=<hmac over "seconds.body">` under `cf-signature` — and this service was the
+ * estate's last verifier of the old `sha256=<hex>` scheme. Measured against the running estate
+ * before the change: a correctly contract-signed deposit envelope answered `401 bad_signature`
+ * and the legacy MAC answered 200. So no deposit confirmation and no settlement outcome could
+ * reach this service at all, while `/livez` stayed green and the producers' relays retried for
+ * ever.
+ *
+ * The old scheme is not kept as a second arm. It covers the body ALONE with no timestamp, which
+ * makes any captured POST to a route that CREDITS MONEY a permanent forgery credential; the
+ * freshness window `verifyDelivery` enforces is the entire reason to move. `micro-settlement`
+ * kept a metered arm because producers still used it — none remain here, so an arm would preserve
+ * that credential for nobody. `micro-admin-api` removed the same shape from its audit intake.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * A topic this service does not subscribe to is a 202 rather than a 404. The relay treats any
  * non-2xx as a delivery failure and retries it for ever, so answering 404 to an event we do not
@@ -821,10 +847,22 @@ function buildRoutes(): Route[] {
  */
 async function handleEvent(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   const raw = await readRaw(ctx.req)
-  const presented = headerOf(ctx.req, 'x-cloudsforge-signature') ?? ''
-  if (!verifyEventSignature(raw, deps.eventSigningSecret, presented)) {
-    ctx.log.warn('event rejected: bad signature', { eventId: headerOf(ctx.req, 'x-event-id') })
+  const presented = headerOf(ctx.req, SIGNATURE_HEADER)
+  const verification = presented
+    ? verifyDelivery(raw, presented, deps.eventSigningSecret)
+    : ({ ok: false, reason: 'malformed_header' } as const)
+  if (!verification.ok) {
+    // The reason is logged and never returned: telling a prober "stale" rather than "mismatch"
+    // tells them which half of a forgery to fix.
+    ctx.log.warn('event rejected: bad signature', {
+      eventId: headerOf(ctx.req, EVENT_ID_HEADER),
+      reason: verification.reason,
+    })
     return errorReply(401, 'bad_signature', 'the event signature did not verify', ctx.requestId)
+  }
+  if (verification.keyIndex > 0) {
+    // Still accepting a rotated-out secret. Not an error; a countdown.
+    ctx.log.warn('event signed with a superseded secret', { keyIndex: verification.keyIndex })
   }
 
   let envelope: { id?: unknown; topic?: unknown; payload?: unknown }
