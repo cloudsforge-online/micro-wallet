@@ -42,6 +42,7 @@ import { recoverAddress } from './secp256k1.ts'
 import { staticFeeQuoter } from './settlement.ts'
 import { personalSignDigest } from './siwe.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
+import { CustodyRefusedError, custodyKeyUrn } from './custodyclient.ts'
 import type { CustodyAddress, CustodyClient, CreateAddressRequest } from './custodyclient.ts'
 import type { ActivityPage, IndexerClient, ObservedActivity } from './indexerclient.ts'
 import {
@@ -304,9 +305,24 @@ export interface FakeCustody extends CustodyClient {
 /**
  * Mints deterministic EVM addresses, and returns the same one for the same idempotency key.
  *
- * That last part is not decoration: `assignDepositAddress` relies on it, because a retry that
- * minted a second address would produce an address the user was never told about and that nobody
- * is watching.
+ * ── WHAT THIS FAKE IS FOR, AND WHAT IT PROVED NOTHING ABOUT ──────────────────────────────────
+ *
+ * It is here so a test about assignment, rotation and watching does not need a key store. It is
+ * NOT evidence about the custody seam, and for the whole of its life it read as though it were:
+ * it returned a `custodyKeyUrn` that custody has never published, and it accepted a request with
+ * no `orderId`, which custody refuses 400 (`custody/src/server.ts:349`). Every deposit test in
+ * this suite passed against it while the live funding path was dead.
+ *
+ * Two things changed so that it cannot do that again. It now **refuses a request custody would
+ * refuse**, by the same rule (`stringField`, `custody/src/server.ts:852`), so a caller that stops
+ * sending the binding fails here too. And the URN it returns is minted by the SAME function the
+ * real client uses, so the two cannot disagree about the form. The shape of the wire itself is
+ * `custodycontract.test.ts`'s job, over a real socket, against a stub that speaks custody's
+ * envelope — not this.
+ *
+ * The idempotency-key dedupe below is kept because callers rely on it, but note that CUSTODY DOES
+ * NOT DO THIS: it has no idempotency handling at all and `provisionAddress` mints unconditionally
+ * (`custody/src/keys.ts:101`). Do not read a passing retry test here as evidence about the estate.
  */
 export function fakeCustody(): FakeCustody {
   const minted: CreateAddressRequest[] = []
@@ -316,12 +332,21 @@ export function fakeCustody(): FakeCustody {
     minted,
     async createAddress(request) {
       minted.push(request)
+      for (const [name, value] of [
+        ['chain', request.chain],
+        ['userId', request.userId],
+        ['orderId', request.orderId],
+      ] as const) {
+        if (typeof value !== 'string' || value.trim().length === 0) {
+          throw new CustodyRefusedError(400, 'bad_request', `${name} must be a non-empty string`)
+        }
+      }
       const existing = byKey.get(request.idempotencyKey)
       if (existing) return existing
       counter += 1
       const address = `0x${counter.toString(16).padStart(40, 'a')}`
       const created: CustodyAddress = {
-        custodyKeyUrn: `cf:custody:key:${counter}`,
+        custodyKeyUrn: custodyKeyUrn({ chain: request.chain, network: request.network, address }),
         address,
         chain: request.chain,
         network: request.network,

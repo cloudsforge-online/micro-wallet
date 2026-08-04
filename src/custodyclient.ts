@@ -103,10 +103,68 @@ export class CustodyRefusedError extends Error {
   }
 }
 
+/**
+ * Custody answered 2xx and the body was not the shape custody publishes.
+ *
+ * ── THIS IS THE CLASS OF DEFECT THAT MADE THIS FILE WRONG FOR ITS WHOLE LIFE ─────────────────
+ *
+ * `CustodyAddress` used to be handed straight out of `client.request<CustodyAddress>()`, which is
+ * a cast and not a check. Custody replies `{ key: {…} }` (`custody/src/server.ts:368`) and has
+ * never published a `custodyKeyUrn`, so every field this service wanted was `undefined` — and
+ * `undefined` does not announce itself. It travels: into `canonicaliseAddress(chain, undefined)`
+ * as a `TypeError` on `.trim()`, or into `custody_key_urn text not null` as a constraint
+ * violation, and either way the caller is told `internal`.
+ *
+ * A response the peer decided to send that this service cannot read is neither a refusal nor an
+ * outage, so it is neither of the two errors above it. `server.ts` maps it to 502: the peer
+ * answered and the answer was unusable, which is the one thing a retry will not fix.
+ */
+export class CustodyContractError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CustodyContractError'
+  }
+}
+
 export type KeyScheme = 'flat_random' | 'hd_bip44'
 
+const SCHEMES: ReadonlySet<string> = new Set<KeyScheme>(['flat_random', 'hd_bip44'])
+
+/**
+ * The handle this service stores for a custody key.
+ *
+ * ── CUSTODY HAS NO URN, AND IT IS RIGHT NOT TO ───────────────────────────────────────────────
+ *
+ * The docstring above this used to promise `cf:custody:key:<id>`, and custody has no id: its key
+ * table is keyed by `address` (`custody/src/migrations.ts:98`), `04-domain-model.md` §3.3 lists no
+ * identifier field at all, and every route that names one key names it by address —
+ * `GET /v1/addresses/:address`, and the `/v1/sign` binding whose five fields include `address`
+ * (`12-security-decisions.md:398`). Asking custody to invent an identifier so that this column
+ * could be filled would be adding an identity to the service that holds keys, in order to satisfy
+ * a naming choice made in the service that does not.
+ *
+ * So the URN is minted here. `04-domain-model.md:20` sets the form as `cf:<service>:<type>:<id>`
+ * and allows "chain addresses" as the id where "an external system dictates otherwise" — but an
+ * address alone is not unique across networks. That is not hypothetical for this estate: the XRP
+ * testnet/mainnet address collision is a recorded defect (`04-domain-model.md` §4.1) and it is
+ * why `hd_bip44` puts the network in the coin type (`custody/src/keys.ts:112-121`). `chain` and
+ * `network` are therefore qualifiers, exactly as `cf:chain:<chain>:<network>:<hash>` already does
+ * for transactions elsewhere in the estate.
+ *
+ * Every segment comes from custody's own reply, in custody's own spelling, so the URN dereferences
+ * back to custody unchanged. `deposits.ts` re-canonicalises the address it *stores*; it must not
+ * re-canonicalise the address it *names*.
+ */
+export function custodyKeyUrn(key: {
+  readonly chain: string
+  readonly network: string
+  readonly address: string
+}): string {
+  return `cf:custody:key:${key.chain}:${key.network}:${key.address}`
+}
+
 export interface CustodyAddress {
-  /** `cf:custody:key:<id>`. A handle, never key material. */
+  /** `cf:custody:key:<chain>:<network>:<address>`. A handle, never key material. */
   readonly custodyKeyUrn: string
   /** The chain's own canonical display form. Re-canonicalised on arrival regardless. */
   readonly address: string
@@ -124,11 +182,52 @@ export interface CreateAddressRequest {
   /** `deposit` here, always. The other purposes belong to settlement and mint. */
   readonly purpose: 'deposit'
   /**
-   * Makes the call safe to retry. Custody returns the same address for the same key rather than
-   * minting a second one — a second address for one assignment is an address nobody is watching
-   * and a deposit nobody sees.
+   * **The signing binding, and the reason this key exists.** Required by custody
+   * (`custody/src/server.ts:349` — `stringField`, no default, unlike the three `enumField` calls
+   * below it), stored `not null` (`custody/src/migrations.ts:105`), and compared character for
+   * character before any signature is produced (`custody/src/gates.ts:182`, SD-09 at
+   * `12-security-decisions.md:398`). It was not sent at all until 2026-08-04, so every deposit
+   * provisioning call this service ever made was refused 400.
+   *
+   * **It is the deposit assignment's id**, which is not an arbitrary choice. settlement has to
+   * restate this exact string to sweep the address, has nothing to derive it from, and says so:
+   * "`userId` and `orderId` are whatever wallet used when it had custody mint the address … A
+   * guessed binding is a sweep refused every tick for ever" (`settlement/src/server.ts:739`). The
+   * assignment id is the one value this service can still produce for that address years later —
+   * it is the row's primary key — so it needs no column of its own to stay restatable. It is also
+   * one binding per address rather than one per user-and-asset, which matters because the
+   * binding's entropy is entirely in `userId` and `orderId` (`custody/src/keys.ts:291`) and a
+   * rotation that reused the previous string would spend that entropy twice.
+   *
+   * mint made the same choice for the same reason: `orderId: token.id` (`mint/src/deploy.ts:179`).
+   */
+  readonly orderId: string
+  /**
+   * Sent as `idempotency-key` so a retried POST is safe at the transport.
+   *
+   * **Custody does not honour it yet** — `grep -i idempoten custody/src` matches nothing outside
+   * this service's own outbox, and `provisionAddress` (`custody/src/keys.ts:101`) mints
+   * unconditionally. This used to be documented here as "Custody returns the same address for the
+   * same key", which was never true. Until custody dedupes, `assignDepositAddress`'s find-or-create
+   * row check is the only thing standing between a retry and a second address nobody is watching.
    */
   readonly idempotencyKey: string
+}
+
+/**
+ * Custody's success body: `{ key: <CustodyKeyRecord> }`.
+ *
+ * Declared separately from `CustodyAddress` because they are not the same shape and pretending
+ * they were is the whole defect. `CustodyKeyRecord` is `custody/src/store.ts:62-74`.
+ */
+interface CustodyKeyReply {
+  readonly key?: {
+    readonly address?: unknown
+    readonly chain?: unknown
+    readonly network?: unknown
+    readonly scheme?: unknown
+    readonly derivationPath?: unknown
+  }
 }
 
 export interface CustodyClient {
@@ -153,22 +252,82 @@ export function httpCustodyClient(options: CustodyClientOptions): CustodyClient 
 
   return {
     async createAddress(request) {
+      let body: CustodyKeyReply
       try {
-        const body = await client.request<CustodyAddress>('/v1/addresses', {
+        body = await client.request<CustodyKeyReply>('/v1/addresses', {
           method: 'POST',
           body: {
             userId: request.userId,
             chain: request.chain,
             network: request.network,
             purpose: request.purpose,
+            orderId: request.orderId,
           },
           idempotencyKey: request.idempotencyKey,
         })
-        return body
       } catch (err) {
         throw translate(err)
       }
+      // Outside the catch on purpose: a contract failure is not a transport failure, and wrapping
+      // it in `translate` would report an unreadable 201 as "custody is unavailable" — an
+      // instruction to retry something that will fail identically for ever.
+      return parseAddress(body, request)
     },
+  }
+}
+
+/**
+ * Read custody's reply, and refuse to guess.
+ *
+ * Every field is checked rather than cast. `chain` and `network` are additionally compared with
+ * what was asked for: custody echoes both back, and a mismatch would mean an address on a chain
+ * or a network this service is about to file under a different one — the one class of custody
+ * error that is silently spendable, because a testnet address filed as mainnet is an address a
+ * user is invited to send real money to.
+ */
+function parseAddress(body: CustodyKeyReply, request: CreateAddressRequest): CustodyAddress {
+  const key = body.key
+  if (key === null || typeof key !== 'object') {
+    throw new CustodyContractError(
+      'custody returned no `key` object — its success body is `{ key: … }` ' +
+        '(custody/src/server.ts:368), and the address is inside it',
+    )
+  }
+  const address = key.address
+  if (typeof address !== 'string' || address.trim().length === 0) {
+    throw new CustodyContractError('custody returned a key with no address on it')
+  }
+  if (key.chain !== request.chain) {
+    throw new CustodyContractError(
+      `custody minted a ${String(key.chain)} address for a ${request.chain} request`,
+    )
+  }
+  if (key.network !== request.network) {
+    throw new CustodyContractError(
+      `custody minted a ${String(key.network)} address for a ${request.network} request`,
+    )
+  }
+  const scheme = key.scheme
+  if (typeof scheme !== 'string' || !SCHEMES.has(scheme)) {
+    throw new CustodyContractError(
+      `custody named the scheme '${String(scheme)}', which is not one this service can offer an ` +
+        'export format for — 04-domain-model §3.3 says the scheme decides which formats exist',
+    )
+  }
+  // `derivationPath` is `string | null` on the wire and optional here: `exactOptionalPropertyTypes`
+  // means the null must be dropped rather than assigned, and SDR-08 means a legacy key's absent
+  // path is a fact to carry honestly rather than an empty string to invent.
+  const derivationPath = key.derivationPath
+  if (derivationPath !== null && derivationPath !== undefined && typeof derivationPath !== 'string') {
+    throw new CustodyContractError('custody returned a derivation path that is not a string')
+  }
+  return {
+    custodyKeyUrn: custodyKeyUrn({ chain: request.chain, network: request.network, address }),
+    address,
+    chain: request.chain,
+    network: request.network,
+    scheme: scheme as KeyScheme,
+    ...(typeof derivationPath === 'string' ? { derivationPath } : {}),
   }
 }
 

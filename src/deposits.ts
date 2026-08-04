@@ -191,13 +191,35 @@ export async function assignDepositAddress(
     ? await activeAssignment(deps.sql, input.userId, assetCode, deps.network)
     : null
 
+  /*
+   * THE ASSIGNMENT ID IS MINTED BEFORE THE ADDRESS IS, BECAUSE CUSTODY HAS TO BE TOLD IT.
+   *
+   * `orderId` is one of the five fields custody compares character for character before it will
+   * sign anything with this key (SD-09, `12-security-decisions.md:398`; the comparison is at
+   * `custody/src/gates.ts:182`). settlement must restate it to sweep the address and has nothing
+   * to derive it from — "a guessed binding is a sweep refused every tick for ever"
+   * (`settlement/src/server.ts:739`) — so the value has to be one this service can still produce
+   * for this address indefinitely. The assignment's own primary key is that value, and using it
+   * means the binding needs no column of its own and cannot drift from the row it belongs to.
+   *
+   * The order of the two writes is the same trade custody makes when it writes the key blob before
+   * the row that names it (`custody/src/keys.ts:88-98`). A crash between them leaves an address
+   * custody holds and this service never filed: one unused key, at an address nobody was told and
+   * nothing can be sent to. The other order — the row first, then the mint — would publish an
+   * assignment naming an address that does not exist.
+   */
+  const id = uuidv7()
+
   const minted = await deps.custody.createAddress({
     userId: input.userId,
     chain,
     network: deps.network,
     purpose: 'deposit',
+    orderId: id,
     // Includes the previous assignment id on a rotation, so rotating twice mints twice while
-    // retrying one rotation mints once.
+    // retrying one rotation mints once. Custody does not honour it yet — see
+    // `CreateAddressRequest.idempotencyKey` — so the find-or-create check above is what actually
+    // stops a retry minting twice.
     idempotencyKey: `wallet:deposit:${input.userId}:${assetCode}:${deps.network}:${previous?.id ?? 'first'}`,
   })
   // Re-canonicalised rather than trusted: custody's spelling and this service's comparison form
@@ -229,7 +251,6 @@ export async function assignDepositAddress(
       correlationId: input.correlationId,
     })
 
-    const id = uuidv7()
     const rows = await tx<AssignmentRow[]>`
       insert into deposit_address_assignments (
         id, user_id, asset_code, chain, network, wallet_id, address, address_key,

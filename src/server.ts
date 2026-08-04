@@ -53,7 +53,7 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { Actor } from '@cloudsforge/contracts-money'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { AddressError, isChainId, type ChainId } from './addresses.ts'
-import { CustodyRefusedError, CustodyUnavailableError } from './custodyclient.ts'
+import { CustodyContractError, CustodyRefusedError, CustodyUnavailableError } from './custodyclient.ts'
 import {
   assignDepositAddress,
   DepositError,
@@ -376,12 +376,22 @@ async function handle(
       return errorReply(err.status, err.code, err.message, ctx.requestId)
     }
     if (err instanceof CustodyUnavailableError) {
-      // Not a decision: we do not know whether an address was minted. The custody call carries an
-      // idempotency key derived from `(user, asset, network, previous)`, so a retry gets the same
-      // address rather than a second one — which is what makes 503 an instruction the caller can
-      // safely follow rather than a suggestion to mint an address nobody is watching.
+      // Not a decision: we do not know whether an address was minted. A retry is safe because
+      // `assignDepositAddress` looks for an active assignment first, so the second attempt only
+      // reaches custody if the first left no row — NOT because the idempotency key dedupes, which
+      // this comment used to claim. Custody has no idempotency handling at all
+      // (`custody/src/keys.ts:101` mints unconditionally); the header is sent so that it works the
+      // day custody honours it, and until then the row check is the whole guarantee.
       ctx.log.error('custody unavailable', { err })
       return errorReply(503, 'custody_unavailable', 'address issuance is temporarily unavailable', ctx.requestId)
+    }
+    if (err instanceof CustodyContractError) {
+      // Custody answered, and this service could not read the answer. Neither of the two above:
+      // not a refusal, because nothing was refused; not an outage, because a retry produces the
+      // identical unreadable reply. 502 — the upstream's answer was invalid — and the detail stays
+      // in the log, because "custody sent a body we do not understand" is an operator's sentence.
+      ctx.log.error('custody answered in a shape this service cannot read', { err })
+      return errorReply(502, 'custody_contract', 'address issuance is temporarily unavailable', ctx.requestId)
     }
 
     ctx.log.error('unhandled request failure', { err })
