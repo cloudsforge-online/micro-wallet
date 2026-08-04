@@ -69,6 +69,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  */
 export const CUSTODY_SCOPES: readonly LiveScope[] = Object.freeze(['custody:address:create'])
 
+/** Custody could not be reached, or answered 5xx. We do not know whether an address was minted. */
 export class CustodyUnavailableError extends Error {
   constructor(message: string) {
     super(message)
@@ -76,13 +77,29 @@ export class CustodyUnavailableError extends Error {
   }
 }
 
-/** Custody looked at the request and refused it. Not retriable. */
+/**
+ * Custody looked at the request and refused it. Not retriable.
+ *
+ * ── IT CARRIED NO STATUS, AND IT CARRIED THE WRONG MESSAGE ───────────────────────────────────
+ *
+ * This used to be `new CustodyRefusedError('custody_refused', err.message)`, and `err.message` on
+ * an `HttpError` is `"POST http://custody:4000/v1/addresses → 400"` — the transport's own summary.
+ * Two things were wrong with that at once. The reason custody gave was in `err.body` and was
+ * discarded, so the one actionable fact never left this file; and what took its place named an
+ * internal host and port, which is not a sentence to put in front of a user.
+ *
+ * `status`, `code` and a message parsed out of custody's error envelope instead — the same three
+ * fields `LedgerRefusedError` carries, because `server.ts` has to make the same decision about
+ * both and two shapes would be two decisions.
+ */
 export class CustodyRefusedError extends Error {
   readonly code: string
-  constructor(code: string, message: string) {
+  readonly status: number
+  constructor(status: number, code: string, message: string) {
     super(message)
     this.name = 'CustodyRefusedError'
     this.code = code
+    this.status = status
   }
 }
 
@@ -149,11 +166,45 @@ export function httpCustodyClient(options: CustodyClientOptions): CustodyClient 
         })
         return body
       } catch (err) {
-        if (err instanceof HttpError && err.peerDecided) {
-          throw new CustodyRefusedError('custody_refused', err.message)
-        }
-        throw new CustodyUnavailableError(err instanceof Error ? err.message : String(err))
+        throw translate(err)
       }
     },
+  }
+}
+
+/**
+ * Turn an HTTP failure into one of the two things a caller can act on.
+ *
+ * `HttpError.peerDecided` is the discriminator, exactly as in `ledgerclient.ts`: a 4xx means
+ * custody looked at the request and said no, and the reason is a fact worth carrying. Anything
+ * else — 5xx, a timeout, an open circuit — means we do not know whether an address was minted, and
+ * the only safe instruction is to retry with the same idempotency key.
+ */
+function translate(err: unknown): Error {
+  if (err instanceof HttpError && err.peerDecided) {
+    const parsed = parseError(err.body)
+    return new CustodyRefusedError(err.status, parsed.code, parsed.message)
+  }
+  return new CustodyUnavailableError(err instanceof Error ? err.message : String(err))
+}
+
+/**
+ * Read custody's error envelope.
+ *
+ * Custody replies `{ error: { code, message, requestId } }` — the estate's one error shape, which
+ * this service serves too. Falling back to the raw body rather than to a fixed string keeps a
+ * refusal from a proxy or a misrouted request legible instead of silently becoming
+ * `custody_refused` with nothing attached.
+ */
+function parseError(body: string): { code: string; message: string } {
+  try {
+    const parsed: unknown = JSON.parse(body)
+    const error = (parsed as { error?: { code?: unknown; message?: unknown } }).error
+    return {
+      code: typeof error?.code === 'string' ? error.code : 'custody_refused',
+      message: typeof error?.message === 'string' ? error.message : body.slice(0, 500),
+    }
+  } catch {
+    return { code: 'custody_refused', message: body.slice(0, 500) }
   }
 }

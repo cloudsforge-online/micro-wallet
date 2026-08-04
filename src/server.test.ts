@@ -2,13 +2,14 @@ import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
-import type { Server } from 'node:http'
+import { createServer as createHttpServer, type Server } from 'node:http'
 import type postgres from 'postgres'
 import { SignJWT, generateKeyPair } from 'jose'
 import { AUDIENCE, Verifier } from '@cloudsforge/auth'
 import { Lifecycle, type Probe } from '@cloudsforge/lifecycle'
 import { Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
-import { depositCreditKey } from './deposits.ts'
+import { httpCustodyClient, type CustodyClient } from './custodyclient.ts'
+import { depositCreditKey, type DepositDeps } from './deposits.ts'
 import {
   EVENT_ID_HEADER,
   SIGNATURE_HEADER,
@@ -96,7 +97,7 @@ interface Rig {
 }
 
 async function withServer(
-  options: { probes?: Probe[]; ready?: boolean; verifier?: Verifier },
+  options: { probes?: Probe[]; ready?: boolean; verifier?: Verifier; deposits?: DepositDeps },
   fn: (rig: Rig) => Promise<void>,
 ): Promise<void> {
   const lifecycle = new Lifecycle({ cacheMs: 0 })
@@ -110,7 +111,7 @@ async function withServer(
     metrics,
     verifier: options.verifier ?? workingVerifier(),
     network: 'testnet',
-    deposits: h.deposits,
+    deposits: options.deposits ?? h.deposits,
     withdrawals: h.withdrawals,
     money: h.money,
     portfolio: h.portfolio,
@@ -392,6 +393,133 @@ test('the ledger refusing is shown to the user; the ledger being down is a 503',
   })
 })
 
+/* ------------------------------------------------------------------ custody, when it says no */
+
+/**
+ * A custody that answers over a real socket, exactly what it is told to.
+ *
+ * **Real, because the behaviour under test begins inside `httpCustodyClient`'s own catch.** A fake
+ * `CustodyClient` that threw `CustodyRefusedError` directly would prove only that `server.ts` maps
+ * an error somebody handed it — it would still pass if `custodyclient.ts` classified every failure
+ * as unavailable, or stopped throwing the typed errors at all. Driving a real HTTP response
+ * through `HttpError.peerDecided` is what makes the assertions below say anything.
+ */
+async function withCustodyAnswering(
+  reply: { status: number; body: string },
+  fn: (custody: CustodyClient) => Promise<void>,
+): Promise<void> {
+  const custodyServer = createHttpServer((req, res) => {
+    // Drained rather than ignored: an unread request body keeps the socket busy and the client's
+    // retry then races the close.
+    req.resume()
+    res.writeHead(reply.status, { 'content-type': 'application/json' })
+    res.end(reply.body)
+  })
+  await new Promise<void>((resolve) => custodyServer.listen(0, '127.0.0.1', () => resolve()))
+  const { port } = custodyServer.address() as AddressInfo
+  try {
+    await fn(
+      httpCustodyClient({
+        baseUrl: `http://127.0.0.1:${port}`,
+        token: () => 'a-service-token',
+        // Short, because one of these cases retries: a 5xx is retriable and the client will spend
+        // this budget before it gives up.
+        deadlineMs: 3_000,
+      }),
+    )
+  } finally {
+    await new Promise<void>((resolve) => custodyServer.close(() => resolve()))
+  }
+}
+
+const assignDeposit = (rig: Rig) =>
+  fetch(`${rig.url}/v1/deposits`, {
+    method: 'POST',
+    headers: asUser(),
+    body: JSON.stringify({ assetCode: 'EMBER' }),
+  })
+
+test('THE RULE: custody refusing is the caller’s answer, never a 500', { skip }, async () => {
+  // A refusal is a decision about this request. Reported as 500 it says "we broke" when the truth
+  // is "your request was refused", and the one actionable fact — why — is thrown away.
+  await withCustodyAnswering(
+    {
+      status: 400,
+      body: JSON.stringify({
+        error: {
+          code: 'unknown_chain',
+          message: "'ember' is not a chain this service holds keys for",
+          requestId: 'custody-req-1',
+        },
+      }),
+    },
+    async (custody) => {
+      await withServer({ deposits: { ...h.deposits, custody } }, async (rig) => {
+        const res = await assignDeposit(rig)
+        assert.equal(res.status, 400)
+        const body = (await res.json()) as { error: { code: string; message: string; requestId: string } }
+        assert.equal(body.error.code, 'unknown_chain')
+        assert.match(body.error.message, /not a chain this service holds keys for/)
+        // The estate's one error shape, carrying THIS service's request id — not custody's.
+        assert.equal(body.error.requestId, res.headers.get('x-request-id'))
+        assert.notEqual(body.error.requestId, 'custody-req-1')
+        // And the internal address of an internal service is not part of a user-facing message.
+        assert.equal(/127\.0\.0\.1|http:\/\//.test(body.error.message), false, body.error.message)
+
+        // Nothing was written. A refused mint must not leave an assignment or a managed wallet
+        // behind, because both would claim an address that does not exist.
+        assert.equal((await sql`select 1 from deposit_address_assignments`).length, 0)
+        assert.equal((await sql`select 1 from wallets`).length, 0)
+      })
+    },
+  )
+})
+
+test('custody being unreachable is a 503, which is a retry instruction', { skip }, async () => {
+  // 5xx is not a decision: we do not know whether an address was minted. 503 says so and tells the
+  // caller it may retry — the same treatment `LedgerUnavailableError` gets, for the same reason.
+  await withCustodyAnswering(
+    {
+      status: 500,
+      body: JSON.stringify({ error: { code: 'internal', message: 'the request could not be completed' } }),
+    },
+    async (custody) => {
+      await withServer({ deposits: { ...h.deposits, custody } }, async (rig) => {
+        const res = await assignDeposit(rig)
+        assert.equal(res.status, 503)
+        const body = (await res.json()) as { error: { code: string; message: string } }
+        assert.equal(body.error.code, 'custody_unavailable')
+        // Custody's own words are NOT repeated: "the request could not be completed" from an
+        // upstream would read as a statement about the caller's request, which it is not.
+        assert.equal(/could not be completed/.test(body.error.message), false, body.error.message)
+      })
+    },
+  )
+})
+
+test('custody refusing THIS service’s token does not sign the caller out', { skip }, async () => {
+  // Rule 3 at the head of server.ts, one upstream further out. Custody gates /v1/addresses on
+  // `custody:address:create`; a 403 there is OUR service token failing, and passing it through
+  // tells a user whose own token is perfectly good that they are no longer authenticated.
+  for (const status of [401, 403]) {
+    await withCustodyAnswering(
+      {
+        status,
+        body: JSON.stringify({
+          error: { code: 'forbidden', message: 'missing required authority: custody:address:create' },
+        }),
+      },
+      async (custody) => {
+        await withServer({ deposits: { ...h.deposits, custody } }, async (rig) => {
+          const res = await assignDeposit(rig)
+          assert.equal(res.status, 503, `custody ${status} reached the caller`)
+          assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'custody_unavailable')
+        })
+      },
+    )
+  }
+})
+
 /* ------------------------------------------------------------------ the wallet flow */
 
 test('a wallet is registered, challenged, verified and authorised over HTTP', { skip }, async () => {
@@ -438,6 +566,42 @@ test('a wallet is registered, challenged, verified and authorised over HTTP', { 
     })
     assert.equal(revoked.status, 200)
     assert.deepEqual(((await revoked.json()) as { link: { authorisations: string[] } }).link.authorisations, [])
+  })
+})
+
+test('THE SAME DEFECT, ONE ROUTE OVER: an unreadable signature is 400, not 500', { skip }, async () => {
+  // `verifySiwe` → `recoverAddress` throws `SignatureError`, which — like the two custody errors —
+  // was caught nowhere. `links.ts` translates `SiweError` and rethrows everything else, so any
+  // authenticated user could reach a 500 by submitting sixty-four bits of hex.
+  const signer = evmSigner()
+  await withServer({}, async (rig) => {
+    // A fresh challenge per attempt: step 1 of `verifyChallenge` consumes the nonce before the
+    // signature is looked at, so reusing one would answer `challenge_unusable` and the assertion
+    // below would pass without ever reaching the curve.
+    const challengeFor = async (): Promise<string> => {
+      const created = await fetch(`${rig.url}/v1/wallets`, {
+        method: 'POST',
+        headers: asUser(),
+        body: JSON.stringify({ chain: 'ember', origin: 'external', address: signer.address }),
+      })
+      return ((await created.json()) as { challenge: { nonce: string } }).challenge.nonce
+    }
+
+    for (const signature of [
+      '0xdeadbeef', // not 65 bytes
+      `0x${'11'.repeat(64)}ff`, // a recovery byte that is not 27 or 28
+      `0x${'00'.repeat(32)}${'11'.repeat(32)}1b`, // r = 0
+    ]) {
+      const res = await fetch(`${rig.url}/v1/wallets/verify`, {
+        method: 'POST',
+        headers: asUser(),
+        body: JSON.stringify({ nonce: await challengeFor(), signature }),
+      })
+      assert.equal(res.status, 400, `${signature.slice(0, 12)}… was answered ${res.status}`)
+      const body = (await res.json()) as { error: { code: string; requestId: string } }
+      assert.equal(body.error.code, 'malformed_signature')
+      assert.equal(body.error.requestId, res.headers.get('x-request-id'))
+    }
   })
 })
 

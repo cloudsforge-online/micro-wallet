@@ -53,6 +53,7 @@ import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { Actor } from '@cloudsforge/contracts-money'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { AddressError, isChainId, type ChainId } from './addresses.ts'
+import { CustodyRefusedError, CustodyUnavailableError } from './custodyclient.ts'
 import {
   assignDepositAddress,
   DepositError,
@@ -350,6 +351,37 @@ async function handle(
       // is the only safe instruction.
       ctx.log.error('ledger unavailable', { err })
       return errorReply(503, 'ledger_unavailable', 'the ledger is temporarily unavailable', ctx.requestId)
+    }
+    if (err instanceof CustodyRefusedError) {
+      // ────────────────────────────────────────────────────────────────────────────────────────
+      // NEITHER CUSTODY ERROR WAS CAUGHT ANYWHERE, SO POST /v1/deposits ANSWERED 500 — AND DID SO
+      // ON THE LIVE ESTATE. Both are thrown by `custodyclient.ts` and both fell through to the
+      // generic branch below. They are wrong as a 500 in different ways, which is why they are
+      // two branches and not one.
+      //
+      // This one is a decision: custody read the request and said no. Shown and never retried,
+      // the same treatment `LedgerRefusedError` gets four lines above — one upstream, one rule.
+      //
+      // 401 and 403 are the exception, and they are not this caller's to answer for. Custody
+      // gates /v1/addresses on `custody:address:create` (`CUSTODY_SCOPES`), so a refusal there is
+      // THIS service's token failing. Passing it through tells a user whose own token is
+      // perfectly good that they are no longer authenticated, and their client signs them out —
+      // rule 3 at the head of this file, one hop further out. Address issuance genuinely is not
+      // working, so that is what is reported.
+      // ────────────────────────────────────────────────────────────────────────────────────────
+      if (err.status === 401 || err.status === 403) {
+        ctx.log.error('custody refused this service’s own credential', { err })
+        return errorReply(503, 'custody_unavailable', 'address issuance is temporarily unavailable', ctx.requestId)
+      }
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
+    if (err instanceof CustodyUnavailableError) {
+      // Not a decision: we do not know whether an address was minted. The custody call carries an
+      // idempotency key derived from `(user, asset, network, previous)`, so a retry gets the same
+      // address rather than a second one — which is what makes 503 an instruction the caller can
+      // safely follow rather than a suggestion to mint an address nobody is watching.
+      ctx.log.error('custody unavailable', { err })
+      return errorReply(503, 'custody_unavailable', 'address issuance is temporarily unavailable', ctx.requestId)
     }
 
     ctx.log.error('unhandled request failure', { err })

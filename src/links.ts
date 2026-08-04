@@ -39,6 +39,7 @@
 import { randomBytes } from 'node:crypto'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { canonicaliseAddress, type ChainId } from './addresses.ts'
+import { SignatureError } from './secp256k1.ts'
 import { WALLET_LINK_REVOKED, WALLET_LINK_VERIFIED, writeEvent, type Db, type Tx } from './outbox.ts'
 import {
   IMPLEMENTED_SCHEMES,
@@ -374,6 +375,21 @@ export async function verifyChallenge(
     })
   } catch (err) {
     if (err instanceof SiweError) throw new LinkError(err.code, err.message, 400)
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    // THE SAME DEFECT AS THE TWO CUSTODY ERRORS, ONE ROUTE OVER. `verifySiwe` reaches
+    // `recoverAddress`, and a signature that is not 65 bytes, or whose recovery byte is not 27 or
+    // 28, or whose r or s is zero, throws `SignatureError` — a typed error nothing caught. It fell
+    // through to the generic handler, so any authenticated user could answer a challenge with four
+    // bytes of hex and be told the server had broken.
+    //
+    // It is a 400 because it is: the caller sent something that is not a signature. Told apart
+    // from `bad_signature` deliberately — that one means "signed by somebody else", and reporting
+    // "your hex is malformed" as "wrong signer" sends an integrator hunting the wrong bug. Neither
+    // is an oracle: both describe the caller's own input, unlike the nonce failures above.
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    if (err instanceof SignatureError) {
+      throw new LinkError('malformed_signature', `that is not a readable signature: ${err.message}`, 400)
+    }
     throw err
   }
 
