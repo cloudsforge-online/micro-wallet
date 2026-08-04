@@ -57,6 +57,7 @@ import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import {
   CustodyContractError,
+  CustodyRefusedError,
   custodyKeyUrn,
   httpCustodyClient,
   type CustodyClient,
@@ -119,11 +120,24 @@ interface CustodyLike {
  * 400 survived a green suite.
  */
 async function custodyLike(
-  options: { readonly override?: (body: Record<string, unknown>) => unknown } = {},
+  options: {
+    readonly override?: (body: Record<string, unknown>) => unknown
+    /**
+     * Answer every provisioning call 409 `idempotency_conflict`.
+     *
+     * The only way to reach that refusal for real is to lose a race, and a test that has to win a
+     * race to assert something is a test that stops asserting it on a slow machine. This is the
+     * refusal held still: custody has decided somebody else is already provisioning this, and what
+     * is under test is what THIS service does about it.
+     */
+    readonly alwaysConflict?: boolean
+  } = {},
 ): Promise<CustodyLike> {
   const seen: Recorded[] = []
   const mintedAddresses: string[] = []
   let counter = 0
+  /** `(created_by, idempotency_key)` → the request it was first used for. One caller, so just the key. */
+  const byIdempotencyKey = new Map<string, { address: string; orderId: string; key: Record<string, unknown> }>()
 
   const server: Server = createHttpServer((req, res) => {
     const chunks: Buffer[] = []
@@ -165,6 +179,38 @@ async function custodyLike(
         }
       }
 
+      const errorReply = (status: number, code: string, message: string) => {
+        res.writeHead(status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { code, message, requestId: 'custody-req' } }))
+      }
+
+      if (options.alwaysConflict) {
+        return errorReply(409, 'idempotency_conflict', 'this idempotency key has already been used')
+      }
+
+      /*
+       * IDEMPOTENCY, AS CUSTODY IMPLEMENTS IT SINCE ITS MIGRATION 6.
+       *
+       * `idempotency-key` is a HEADER, set by `@cloudsforge/http` from `request.idempotencyKey` and
+       * read by custody at `custody/src/server.ts:367`. Same key and same binding is a replay: 200,
+       * `reused: true`, and the ORIGINAL address. Same key and a DIFFERENT `orderId` is a 409, not
+       * an address — custody refuses rather than hand back a key bound to another order, because
+       * settlement restates `orderId` to sweep and a mismatch is a sweep refused for ever.
+       */
+      const header = req.headers['idempotency-key']
+      const idemKey = typeof header === 'string' ? header : undefined
+      if (idemKey !== undefined) {
+        const prior = byIdempotencyKey.get(idemKey)
+        if (prior) {
+          if (prior.orderId !== String(body['orderId'])) {
+            return errorReply(409, 'idempotency_conflict', 'this idempotency key has already been used')
+          }
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ key: prior.key, reused: true }))
+          return
+        }
+      }
+
       counter += 1
       // `toKeyRecord` (`custody/src/store.ts:83-96`) — every field it publishes, and nothing else.
       // No URN, no id: `custody_keys` is keyed by `address` (`custody/src/migrations.ts:98`).
@@ -183,7 +229,10 @@ async function custodyLike(
         createdAt: new Date().toISOString(),
         exportedAt: null,
       }
-      // `{ status: 201, body: { key } }` — `custody/src/server.ts:368`. The envelope matters as
+      if (idemKey !== undefined) {
+        byIdempotencyKey.set(idemKey, { address, orderId: String(body['orderId']), key })
+      }
+      // `{ status: 201, body: { key } }` — `custody/src/server.ts:381`. The envelope matters as
       // much as the fields: a client that reads the top level finds nothing it wants.
       const reply = options.override ? options.override(body) : { key }
       res.writeHead(201, { 'content-type': 'application/json' })
@@ -211,7 +260,7 @@ async function custodyLike(
 
 async function withCustody(
   fn: (custody: CustodyLike) => Promise<void>,
-  options: { readonly override?: (body: Record<string, unknown>) => unknown } = {},
+  options: Parameters<typeof custodyLike>[0] = {},
 ): Promise<void> {
   const custody = await custodyLike(options)
   try {
@@ -249,6 +298,55 @@ test('the request custody is sent carries every field custody requires', async (
       'custody requires orderId (custody/src/server.ts:349) and it is the signing binding SD-09 ' +
         'compares character for character — a call without it is refused 400 for ever',
     )
+  })
+})
+
+test('THE CONTRACT: a repeat under one key is a 200 replay, and reads exactly like a 201', async () => {
+  // Custody answers a replay 200 with `{ key, reused: true }` rather than 201, deliberately: a 201
+  // would tell this service — and every log and dashboard reading the status — that an address was
+  // created. This client must not care, and this asserts it does not: same address, same shape, no
+  // throw. `HttpClient` treats any 2xx as an answer, so the only way this breaks is a future status
+  // check written here.
+  await withCustody(async (custody) => {
+    const request = {
+      userId: USER,
+      chain: 'ember',
+      network: 'testnet',
+      purpose: 'deposit',
+      orderId: 'a-deposit-assignment-id',
+      idempotencyKey: 'wallet:deposit:alice:EMBER:testnet:first',
+    } as const
+    const first = await custody.client.createAddress(request)
+    const second = await custody.client.createAddress(request)
+    assert.equal(second.address, first.address, 'a retry must be given the address already published')
+    assert.equal(second.custodyKeyUrn, first.custodyKeyUrn)
+    assert.equal(custody.mintedAddresses.length, 1, 'and custody must have minted exactly once')
+  })
+})
+
+test('THE CONTRACT: one key over two orders is a refusal this service can recognise', async () => {
+  // The 409 has to arrive as something `deposits.ts` can branch on, which means `code`, not a
+  // message. `CustodyRefusedError` carries it because `translate()` parses custody's error envelope
+  // rather than reporting the transport's own summary.
+  await withCustody(async (custody) => {
+    const base = {
+      userId: USER,
+      chain: 'ember',
+      network: 'testnet',
+      purpose: 'deposit',
+      idempotencyKey: 'wallet:deposit:alice:EMBER:testnet:first',
+    } as const
+    await custody.client.createAddress({ ...base, orderId: 'assignment-1' })
+    await assert.rejects(
+      () => custody.client.createAddress({ ...base, orderId: 'assignment-2' }),
+      (err: unknown) => {
+        assert.ok(err instanceof CustodyRefusedError, 'a 409 is custody deciding, not custody being unavailable')
+        assert.equal(err.status, 409)
+        assert.equal(err.code, 'idempotency_conflict')
+        return true
+      },
+    )
+    assert.equal(custody.mintedAddresses.length, 1)
   })
 })
 
@@ -468,6 +566,46 @@ test(
     })
   },
 )
+
+test('a 409 from custody returns the assignment that already exists, not an error', { skip }, async () => {
+  /*
+   * THE LOSER OF A DOUBLE-TAP GETS THE WINNER'S ADDRESS.
+   *
+   * Two calls that both got past `activeAssignment` send custody two different `orderId`s under one
+   * derived key, so custody refuses the second — see `CreateAddressRequest.idempotencyKey`. The
+   * refusal is not this caller's problem to report: the address it was asking for now exists, and
+   * the right answer is to go and read it.
+   *
+   * Driven with a custody that refuses unconditionally rather than by racing two calls, because a
+   * race that has to be won to assert anything asserts nothing on a machine that schedules it the
+   * other way.
+   */
+  await withCustody(async (custody) => {
+    const winner = await assignDepositAddress(
+      { ...h.deposits, custody: custody.client },
+      { userId: USER, assetCode: 'EMBER', correlationId: 'corr-1' },
+    )
+
+    await withCustody(
+      async (conflicting) => {
+        const loser = await assignDepositAddress(
+          { ...h.deposits, custody: conflicting.client },
+          // `rotate` is what gets past the find-or-create check, which is the position a racing
+          // caller is in: it looked, saw nothing, and by the time it asked custody it was second.
+          { userId: USER, assetCode: 'EMBER', correlationId: 'corr-2', rotate: true },
+        )
+        assert.equal(loser.id, winner.id, 'the loser must be handed the winner’s assignment')
+        assert.equal(loser.address, winner.address)
+      },
+      { alwaysConflict: true },
+    )
+
+    const rows = await sql<{ n: number }[]>`
+      select count(*)::int as n from deposit_address_assignments where user_id = ${USER}
+    `
+    assert.equal(rows[0]?.n, 1, 'and there is still exactly one assignment, on one address')
+  })
+})
 
 test('the assignment row keeps the binding a sweep will have to restate', { skip }, async () => {
   await withCustody(async (custody) => {

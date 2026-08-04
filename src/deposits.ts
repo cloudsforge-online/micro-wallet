@@ -48,7 +48,7 @@ import {
 import type { Actor } from '@cloudsforge/contracts-money'
 import { canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts'
 import { uuidv7 } from './ids.ts'
-import type { CustodyClient } from './custodyclient.ts'
+import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
 import type { LedgerClient } from './ledgerclient.ts'
 import {
@@ -154,7 +154,9 @@ export interface AssignInput {
  * Find-or-create rather than always-create: a user who taps "deposit" twice must get one address,
  * not two, because the second would be an address nobody has told them about and money sent to it
  * would still be theirs but nobody would be looking. The custody call carries an idempotency key
- * derived from the same triple, so even a retry that races past the row check gets one address.
+ * derived from the same triple, so even a retry that races past the row check gets one address —
+ * a sentence that was aspirational until custody's migration 6 and is now enforced by a unique
+ * index on custody's own table.
  */
 export async function assignDepositAddress(
   deps: DepositDeps,
@@ -210,18 +212,52 @@ export async function assignDepositAddress(
    */
   const id = uuidv7()
 
-  const minted = await deps.custody.createAddress({
-    userId: input.userId,
-    chain,
-    network: deps.network,
-    purpose: 'deposit',
-    orderId: id,
-    // Includes the previous assignment id on a rotation, so rotating twice mints twice while
-    // retrying one rotation mints once. Custody does not honour it yet — see
-    // `CreateAddressRequest.idempotencyKey` — so the find-or-create check above is what actually
-    // stops a retry minting twice.
-    idempotencyKey: `wallet:deposit:${input.userId}:${assetCode}:${deps.network}:${previous?.id ?? 'first'}`,
-  })
+  /*
+   * THE KEY IS DERIVED FROM THE POSITION IN THE CHAIN OF ASSIGNMENTS, NOT FROM `id`.
+   *
+   * `id` is minted fresh on every attempt, so keying on it would give two racing calls two keys and
+   * custody two requests. The triple plus the assignment being SUPERSEDED is stable across attempts
+   * and different across rotations: retrying one rotation carries one key, and rotating twice
+   * carries two. Custody honours it now (its migration 6) and the find-or-create check above is no
+   * longer the only thing between a retry and a second address.
+   *
+   * `'first'` is reused only if a (user, asset, network) can return to having no assignment at all,
+   * and it cannot: a rotation marks the old row `'rotated'` and nothing in this service ever writes
+   * `'retired'` to an assignment.
+   */
+  const idempotencyKey = `wallet:deposit:${input.userId}:${assetCode}:${deps.network}:${previous?.id ?? 'first'}`
+
+  let minted: CustodyAddress
+  try {
+    minted = await deps.custody.createAddress({
+      userId: input.userId,
+      chain,
+      network: deps.network,
+      purpose: 'deposit',
+      orderId: id,
+      idempotencyKey,
+    })
+  } catch (err) {
+    /*
+     * A 409 MEANS SOMEBODY ELSE IS ALREADY DOING THIS, AND THEY WON.
+     *
+     * Two calls that both got past the find-or-create check above — a user tapping "deposit" twice
+     * — mint two assignment ids and therefore send custody two DIFFERENT `orderId`s under one key.
+     * Custody refuses the second rather than answering it with the first one's address, because
+     * that address is bound to the first one's order and settlement would restate this one's and be
+     * refused for ever. So the loser's job is not to retry: it is to go and read what the winner
+     * wrote, which is the address this call was always going to return.
+     *
+     * If the winner has not committed yet the refusal is re-raised, and the caller's own retry
+     * takes the find-or-create path. That is a moment of unavailability rather than a second
+     * address, which is the right way round.
+     */
+    if (err instanceof CustodyRefusedError && err.code === 'idempotency_conflict') {
+      const winner = await activeAssignment(deps.sql, input.userId, assetCode, deps.network)
+      if (winner) return winner
+    }
+    throw err
+  }
   // Re-canonicalised rather than trusted: custody's spelling and this service's comparison form
   // must be produced by one function, or the `address_key` written here will not match the one a
   // deposit event is looked up by.

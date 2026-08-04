@@ -205,11 +205,24 @@ export interface CreateAddressRequest {
   /**
    * Sent as `idempotency-key` so a retried POST is safe at the transport.
    *
-   * **Custody does not honour it yet** — `grep -i idempoten custody/src` matches nothing outside
-   * this service's own outbox, and `provisionAddress` (`custody/src/keys.ts:101`) mints
-   * unconditionally. This used to be documented here as "Custody returns the same address for the
-   * same key", which was never true. Until custody dedupes, `assignDepositAddress`'s find-or-create
-   * row check is the only thing standing between a retry and a second address nobody is watching.
+   * **Custody honours it as of its migration 6**, and did not before. This docstring twice said
+   * something untrue about another repository: first "Custody returns the same address for the same
+   * key", then — after that was found to be false — "Custody does not honour it yet", which was
+   * true when written and is not now. Both are re-checked against custody's source rather than
+   * against this comment's history:
+   *
+   *   * the header is read at `custody/src/server.ts:367` and carried into `provisionAddress`;
+   *   * a repeat under one key returns the ORIGINAL address with 200 and `reused: true`
+   *     (`custody/src/keys.ts` `findReplay`);
+   *   * and the invariant is a unique index, `custody_keys_idempotency_uniq` on
+   *     `(created_by, idempotency_key)`, so a retry that races the lookup is refused by the
+   *     database rather than by a check that happened to run first.
+   *
+   * **Reusing one key for a DIFFERENT request is a 409 `idempotency_conflict`, not an address.**
+   * That is deliberate on custody's side and this service depends on it: `orderId` is the binding
+   * settlement restates to sweep, so being handed the previous request's address under this
+   * request's order would strand every future sweep. `assignDepositAddress` handles the 409 by
+   * re-reading the assignment the winner wrote.
    */
   readonly idempotencyKey: string
 }
