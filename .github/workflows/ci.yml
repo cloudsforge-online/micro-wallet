@@ -176,3 +176,19 @@ jobs:
             exit 1
           fi
           echo 'ok: no secret-shaped value in the image environment'
+
+  publish:
+    needs: [estate, controls]
+    # A green push to main and nothing else. An image tag a release manifest pins has to name
+    # something that passed, on the branch it will be deployed from.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
+    with:
+      kind: service
+    secrets:
+      # The sibling checkouts the Dockerfile's named build contexts need; without a
+      # contents:read token they 404 and the build fails at the first COPY --from.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: write
