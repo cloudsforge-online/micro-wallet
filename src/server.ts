@@ -51,7 +51,13 @@ import {
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { Actor } from '@cloudsforge/contracts-money'
-import type { Network } from '@cloudsforge/contracts-chain'
+import {
+  CHAINS,
+  assertIssuable,
+  type AssetCode,
+  type IssuableAssetCode,
+  type Network,
+} from '@cloudsforge/contracts-chain'
 import { AddressError, isChainId, type ChainId } from './addresses.ts'
 import { CustodyContractError, CustodyRefusedError, CustodyUnavailableError } from './custodyclient.ts'
 import {
@@ -767,6 +773,11 @@ function buildRoutes(): Route[] {
           clientKey,
           correlationId: ctx.requestId,
           actor: actorOf(principal),
+          // OPTIONAL, defaulting to EMBER inside `spend`. A caller that names a retired asset is
+          // refused HERE, with a 400 naming the asset, rather than reaching the ledger and getting
+          // its trigger's message — the two are the same refusal and only one of them tells the
+          // caller which field to change.
+          ...issuableAsset(optionalString(body, 'assetCode')),
         })
         deps.metrics.increment('wallet_money_operations_total', {
           route: 'spend',
@@ -1054,6 +1065,41 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   } catch (err) {
     if (err instanceof BadRequestError) throw err
     throw new BadRequestError('bad_body', 'request body is not valid JSON')
+  }
+}
+
+/**
+ * Narrow a caller-supplied asset code to one that may be newly denominated, or refuse.
+ *
+ * **THE BOUNDARY WHERE `IssuableAssetCode` STOPS BEING A COMPILE-TIME GUARANTEE.** Inside the
+ * service the type carries the rule; a JSON body carries a string, so the rule has to be re-checked
+ * exactly once, here, at the point the string becomes a typed value. `assertIssuable` is
+ * `contracts-chain`'s own narrowing and throws a `RangeError`, which is turned into a 400 rather
+ * than allowed to reach the error handler as a 500 — the caller made a recoverable mistake and the
+ * message has to say which asset and why.
+ *
+ * Returns a SPREADABLE object rather than a value, because `exactOptionalPropertyTypes` is on:
+ * passing `assetCode: undefined` is a different thing from not passing it, and the compiler is
+ * right to insist the difference be stated.
+ */
+function issuableAsset(raw: string | undefined): { readonly assetCode?: IssuableAssetCode } {
+  if (raw === undefined) return {}
+  const upper = raw.toUpperCase()
+  // Membership is read off `CHAINS`, which is `Record<AssetCode, ChainSpec>` and therefore TOTAL
+  // over the union. A hand-written list here would be a second declaration of `AssetCode`, free to
+  // drift from the first in silence — the failure `RETIRED_ASSETS` and `chain_assets` both have
+  // paragraphs about.
+  if (!Object.hasOwn(CHAINS, upper)) {
+    throw new BadRequestError('unknown_asset', `'${raw}' is not an asset this estate knows`)
+  }
+  try {
+    return { assetCode: assertIssuable(upper as AssetCode) }
+  } catch {
+    throw new BadRequestError(
+      'retired_asset',
+      `${upper} is retired and may not denominate a new purchase. Existing balances can still be ` +
+        'transferred, converted or withdrawn.',
+    )
   }
 }
 

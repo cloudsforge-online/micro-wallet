@@ -198,7 +198,7 @@ test('peek answers a completed operation without re-deriving the request', { ski
 /* ------------------------------------------------------------------ spend */
 
 test('a spend debits the user and credits platform revenue', { skip }, async () => {
-  h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  h.ledger.credit(`user:${USER}`, 'EMBER', 500n)
   const result = await spend(h.money, {
     userId: USER,
     amount: 120n,
@@ -209,15 +209,123 @@ test('a spend debits the user and credits platform revenue', { skip }, async () 
   })
 
   assert.equal(result.replayed, false)
-  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 380n)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 380n)
   // The counter-account is what makes "how much did this product earn" a query over the journal.
   // Today `ledger.source` is populated only by the /internal/* routes, so per-product revenue is
   // not derivable from the estate at all.
-  assert.equal(h.ledger.balanceOf('platform', 'SHARD', 'fees'), 120n)
+  assert.equal(h.ledger.balanceOf('platform', 'EMBER', 'fees'), 120n)
+})
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE RETIRED-ASSET DEFECT, AND THE THREE THINGS THAT MUST ALL BE TRUE AT ONCE.
+ *
+ * `spend` was hard-coded to SHARD. `micro-ledger` migration 13 refuses a retired asset on an
+ * ACQUISITION kind, and `purchase` is one, so every call to `POST /v1/spend` 400'd in production
+ * while this suite stayed green — the fake ledger did not model the guard. It does now.
+ *
+ * The temptation was to relabel the kind, since `transfer`, `conversion` and `adjustment` all stay
+ * legal for a retired asset. That would have passed immediately and been a lie: a sale booked to
+ * revenue is not an adjustment, and it would have re-opened the exact hole the guard closes.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a spend defaults to EMBER and no longer trips the retired-asset guard', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'EMBER', 500n)
+  await spend(h.money, {
+    userId: USER,
+    amount: 10n,
+    reason: 'x',
+    clientKey: 'k-default',
+    correlationId: 'r',
+    actor: `user:${USER}`,
+  })
+  const entry = h.ledger.entries.at(-1)!
+  assert.equal(entry.kind, 'purchase', 'the kind is still honest about what happened')
+  for (const posting of entry.postings ?? []) {
+    assert.equal(posting.assetCode, 'EMBER')
+    assert.notEqual(posting.assetCode, 'SHARD')
+  }
+})
+
+test('the ledger would still refuse a purchase denominated in a retired asset', { skip }, async () => {
+  // The guard is real and this proves the fake models it — without which the test above could pass
+  // for the wrong reason. `spend` can no longer REACH this state (the type forbids it), so it is
+  // driven through the ledger client directly.
+  h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  await assert.rejects(
+    () =>
+      h.ledger.postEntry({
+        kind: 'purchase',
+        actor: `user:${USER}`,
+        correlationId: 'r',
+        idempotencyKey: 'direct-shard-purchase',
+        description: 'a sale priced in a wound-down unit',
+        postings: [
+          {
+            direction: 'debit',
+            amount: 10n,
+            assetCode: 'SHARD',
+            sequence: 0,
+            account: { subject: `user:${USER}`, assetCode: 'SHARD', purpose: 'available', type: 'liability' },
+          },
+          {
+            direction: 'credit',
+            amount: 10n,
+            assetCode: 'SHARD',
+            sequence: 1,
+            account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'revenue' },
+          },
+        ],
+      }),
+    /retired/,
+  )
+})
+
+test('a SHARD holder can still convert out, because the guard permits conversion', { skip }, async () => {
+  /*
+   * THE HALF OF THE GUARD THAT MATTERS MOST. 69 holders have 69,000 SHARD units. Retiring an asset
+   * must never strand them, so `conversion` stays legal — and this asserts the drain route works,
+   * which is the property a careless tightening of the guard would break silently.
+   */
+  h.ledger.credit(`user:${USER}`, 'SHARD', 1_000n)
+  const result = await convert(h.money, {
+    userId: USER,
+    fromAssetCode: 'SHARD',
+    toAssetCode: 'EMBER',
+    amount: 100n,
+    clientKey: 'drain-1',
+    correlationId: 'r',
+    actor: `user:${USER}`,
+  })
+  assert.equal(result.replayed, false)
+  assert.equal(h.ledger.entries.at(-1)!.kind, 'conversion')
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 900n)
+})
+
+test('two spends of one amount in two assets are two requests, not a replay', { skip }, async () => {
+  // The asset is in the idempotency fingerprint. Without it the second call would be answered with
+  // the first one's entry — silently, and in the wrong unit.
+  h.ledger.credit(`user:${USER}`, 'EMBER', 500n)
+  h.ledger.credit(`user:${USER}`, 'BTC', 500n)
+  const base = {
+    userId: USER,
+    amount: 10n,
+    reason: 'same reason',
+    clientKey: 'same-key',
+    correlationId: 'r',
+    actor: `user:${USER}`,
+  } as const
+
+  await spend(h.money, { ...base, assetCode: 'EMBER' })
+  await assert.rejects(
+    () => spend(h.money, { ...base, assetCode: 'BTC' }),
+    IdempotencyKeyReuseError,
+    'one key must not answer two different requests',
+  )
 })
 
 test('THE RULE: a retried spend debits exactly once', { skip }, async () => {
-  h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  h.ledger.credit(`user:${USER}`, 'EMBER', 500n)
   const input = {
     userId: USER,
     amount: 120n,
@@ -232,14 +340,14 @@ test('THE RULE: a retried spend debits exactly once', { skip }, async () => {
 
   assert.equal(second.replayed, true)
   assert.equal(second.entryId, first.entryId)
-  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 380n)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 380n)
   assert.equal(h.ledger.entries.length, 1)
 })
 
 test('an unaffordable spend is the ledger’s refusal, not a check in this service', { skip }, async () => {
   // No read-then-write anywhere: the ledger refuses inside the same transaction as the postings,
   // against the real account, with a real lock. Two spends of the last Shard cannot both succeed.
-  h.ledger.credit(`user:${USER}`, 'SHARD', 50n)
+  h.ledger.credit(`user:${USER}`, 'EMBER', 50n)
   await assert.rejects(
     () =>
       spend(h.money, {
@@ -252,11 +360,11 @@ test('an unaffordable spend is the ledger’s refusal, not a check in this servi
       }),
     (err: unknown) => err instanceof LedgerRefusedError && err.code === 'insufficient_funds',
   )
-  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 50n)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 50n)
 })
 
 test('concurrent spends of one balance cannot both succeed', { skip }, async () => {
-  h.ledger.credit(`user:${USER}`, 'SHARD', 100n)
+  h.ledger.credit(`user:${USER}`, 'EMBER', 100n)
   const results = await Promise.allSettled(
     ['a', 'b', 'c'].map((k) =>
       spend(h.money, {
@@ -270,7 +378,7 @@ test('concurrent spends of one balance cannot both succeed', { skip }, async () 
     ),
   )
   assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1)
-  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 0n)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 0n)
 })
 
 /* ------------------------------------------------------------------ transfer */

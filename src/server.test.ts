@@ -288,8 +288,61 @@ test('a key that is present but too short is refused too', { skip }, async () =>
   })
 })
 
-test('a spend with a key debits once however many times it is retried', { skip }, async () => {
+/**
+ * The boundary where `IssuableAssetCode` stops being a compile-time guarantee.
+ *
+ * Inside the service the TYPE carries the rule, so a retired code cannot reach a posting. A JSON
+ * body carries a string, so the rule is re-checked exactly once, here. Both halves are needed and
+ * neither is redundant: without the type, an internal caller can still write `'SHARD'`; without
+ * this, an external one can.
+ */
+test('a spend naming a retired asset is refused at the boundary, with a usable message', { skip }, async () => {
   h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/spend`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'retired-1' }),
+      body: JSON.stringify({ amount: '100', reason: 'x', assetCode: 'SHARD' }),
+    })
+    assert.equal(res.status, 400)
+    const body = (await res.json()) as { error?: { code?: string; message?: string } }
+    assert.equal(body.error?.code, 'retired_asset')
+    // The message must tell the holder what they CAN still do, because the guard deliberately
+    // leaves every route out of a retired asset open.
+    assert.match(String(body.error?.message), /transferred, converted or withdrawn/)
+    // And nothing moved.
+    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 500n)
+    assert.equal(h.ledger.entries.length, 0)
+  })
+})
+
+test('a spend may name a live asset explicitly', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'BTC', 500n)
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/spend`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'spend-in-btc-1' }),
+      body: JSON.stringify({ amount: '100', reason: 'x', assetCode: 'btc' }),
+    })
+    assert.equal(res.status, 201, 'a lower-cased live asset is accepted and upper-cased')
+    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'BTC', 'available'), 400n)
+  })
+})
+
+test('a spend naming an asset the estate does not know is refused', { skip }, async () => {
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/spend`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'unknown-1' }),
+      body: JSON.stringify({ amount: '100', reason: 'x', assetCode: 'DOGE' }),
+    })
+    assert.equal(res.status, 400)
+    assert.equal(((await res.json()) as { error?: { code?: string } }).error?.code, 'unknown_asset')
+  })
+})
+
+test('a spend with a key debits once however many times it is retried', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'EMBER', 500n)
   await withServer({}, async (rig) => {
     const send = () =>
       fetch(`${rig.url}/v1/spend`, {
@@ -306,7 +359,7 @@ test('a spend with a key debits once however many times it is retried', { skip }
       // or merely found it done, without comparing bodies.
       assert.equal(retry.status, 200)
     }
-    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 400n)
+    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 400n)
     assert.equal(h.ledger.entries.length, 1)
   })
 })

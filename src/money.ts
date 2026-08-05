@@ -50,7 +50,12 @@ import {
   moneyForShards,
   shardsForMoney,
 } from '@cloudsforge/contracts-money'
-import { type AssetCode, chainSpec, formatAmount } from '@cloudsforge/contracts-chain'
+import {
+  chainSpec,
+  formatAmount,
+  type AssetCode,
+  type IssuableAssetCode,
+} from '@cloudsforge/contracts-chain'
 import { chainForAsset } from './addresses.ts'
 import {
   namespacedKey,
@@ -107,6 +112,19 @@ export interface SpendInput {
   readonly clientKey: string
   readonly correlationId: string
   readonly actor: Actor
+  /**
+   * What the user is paying WITH.
+   *
+   * **`IssuableAssetCode`, so a retired asset is a COMPILE error rather than a 400.** That type is
+   * `Exclude<AssetCode, 'SHARD'>` (`contracts/packages/chain/src/index.ts:68`), and typing this
+   * field with it is the whole of the fix — `micro-mint` took the same shape and it is why a retired
+   * code can no longer reach a posting from there either. The alternative, validating at runtime,
+   * would have left the next caller free to make the same mistake and find out from the ledger.
+   *
+   * Defaulted to EMBER rather than required, because every existing caller meant "the platform's
+   * unit" and there was exactly one of those before SHARD was retired.
+   */
+  readonly assetCode?: IssuableAssetCode
 }
 
 export interface MoneyResult {
@@ -116,33 +134,68 @@ export interface MoneyResult {
 }
 
 /**
- * Debit Shards for something the platform provided.
+ * Debit a user for something the platform provided.
  *
  * `purchase` rather than `fee_charged`: the user received a thing. The counter-account is platform
  * revenue, so "how much did this product earn" is a query over the journal rather than a number
  * nobody can derive — 00-current-state records that `ledger.source` is populated only by the
  * `/internal/*` routes today, so per-product revenue is not derivable from the estate at all.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ## This used to be hard-coded to SHARD, and that made it dead code the day SHARD was retired
+ *
+ * `micro-ledger`'s migration 13 refuses a retired asset on an ACQUISITION kind, and `purchase` is
+ * the first kind on that list — "a product being SOLD for a wound-down unit". This function was
+ * exactly that: it debited the user's SHARD and credited platform revenue, under `kind: 'purchase'`,
+ * with the code written as a literal in five places. Every call to `POST /v1/spend` now 400s with
+ * `retired_asset`. It is the same defect `micro-mint` had and it is live code.
+ *
+ * **THE FIX IS NOT TO RELABEL THE KIND, AND THAT DESERVES SAYING OUT LOUD** because it is the
+ * cheap move available here. `transfer`, `conversion` and `adjustment` all remain legal for a
+ * retired asset, so renaming the kind would make this pass immediately — and it would be a lie:
+ * the user is buying a thing from the platform, the counter-account is revenue, and calling that an
+ * `adjustment` would put a sale in the one bucket an auditor reads as "somebody corrected
+ * something". Worse, it would re-open the hole the guard closes, because a sale priced in a
+ * wound-down unit is precisely what must stop happening. The guard is right and this function was
+ * wrong.
+ *
+ * So the asset became a parameter typed `IssuableAssetCode`, which cannot be SHARD, and defaults to
+ * EMBER. A retired code is now refused by `tsc` rather than by Postgres — which is the property
+ * `micro-mint` gained in the same change, and the only one that stops the next caller repeating it.
+ *
+ * **WHAT THIS DOES NOT DO, DELIBERATELY.** It does not add USD-cent pricing the way `micro-mint`'s
+ * migration 6 did. Mint prices a PRODUCT, so it needs a catalogue, a rate read per purchase and
+ * both amounts recorded on the row. This route takes the amount from its caller — there is no price
+ * here to convert and no rate to record, and inventing a conversion would be adding an FX step to a
+ * number somebody already decided. If a priced product is ever put behind this route, mint's shape
+ * is the one to copy, and this paragraph is where to start.
+ *
+ * **THE 69,000 SHARD UNITS ARE UNAFFECTED.** Holders keep every route out — withdrawal, transfer,
+ * conversion to EMBER — because migration 13 leaves all of them legal. What has stopped is selling
+ * something new for Shards, which is the intended effect.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export async function spend(deps: MoneyDeps, input: SpendInput): Promise<MoneyResult> {
   if (input.amount <= 0n) throw new MoneyError('invalid_amount', 'amount must be positive')
   if (input.reason.trim().length === 0) {
     throw new MoneyError('invalid_reason', 'reason must not be empty')
   }
+  const assetCode: IssuableAssetCode = input.assetCode ?? 'EMBER'
 
   const postings: readonly PostingRequest[] = [
     {
       direction: 'debit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode,
       sequence: 0,
-      account: userAvailable(input.userId, 'SHARD'),
+      account: userAvailable(input.userId, assetCode),
     },
     {
       direction: 'credit',
       amount: input.amount,
-      assetCode: 'SHARD',
+      assetCode,
       sequence: 1,
-      account: { subject: 'platform', assetCode: 'SHARD', purpose: 'fees', type: 'revenue' },
+      account: { subject: 'platform', assetCode, purpose: 'fees', type: 'revenue' },
     },
   ]
 
@@ -150,14 +203,17 @@ export async function spend(deps: MoneyDeps, input: SpendInput): Promise<MoneyRe
     route: SPEND_ROUTE,
     userId: input.userId,
     clientKey: input.clientKey,
-    requestHash: requestFingerprint({ amount: input.amount, reason: input.reason }),
+    // THE ASSET IS IN THE FINGERPRINT. Two spends of the same amount for the same reason in two
+    // different assets are two different requests, and an idempotency key that could not tell them
+    // apart would answer the second with the first one's entry — silently, and in the wrong unit.
+    requestHash: requestFingerprint({ amount: input.amount, reason: input.reason, assetCode }),
     kind: 'purchase',
     actor: input.actor,
     description: `Spend: ${input.reason}`.slice(0, 200),
-    metadata: { reason: input.reason, assetCode: 'SHARD', amount: input.amount.toString() },
+    metadata: { reason: input.reason, assetCode, amount: input.amount.toString() },
     postings,
     summary: () => ({
-      assetCode: 'SHARD',
+      assetCode,
       amount: input.amount.toString(),
       reason: input.reason,
     }),

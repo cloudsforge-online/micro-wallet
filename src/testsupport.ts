@@ -64,6 +64,13 @@ interface FakeEntry {
   readonly kind: string
   readonly recordedAt: string
   readonly fingerprint: string
+  /**
+   * The request as posted, kept so a test can assert what was DENOMINATED rather than only what
+   * the balances came to. A balance assertion cannot see the asset code on a posting whose amount
+   * happened to be zero, and it cannot see the entry KIND at all — which is the field the ledger's
+   * retired-asset guard keys on.
+   */
+  readonly postings?: PostEntryRequest['postings']
   readonly response: PostedEntry | Reservation
   /** For a reservation: what to move back on release. */
   readonly reservation?: {
@@ -163,6 +170,36 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
     postEntry(request: PostEntryRequest) {
       return serialise(() => {
         if (options.failWith) throw options.failWith()
+        /*
+         * ══════════════════════════════════════════════════════════════════════════════════════
+         * MIGRATION 13'S RETIRED-ASSET GUARD, MODELLED HERE RATHER THAN ASSUMED AWAY.
+         *
+         * `micro-ledger` refuses a retired asset on an ACQUISITION kind — `purchase`,
+         * `subscription_charge`, `deposit_credited` — and permits it on every other kind, because
+         * retiring an asset must never strand the 69,000 SHARD units 69 holders still have. A fake
+         * that accepted everything would let this service post a `purchase` in SHARD, go green, and
+         * 400 in production, which is exactly what happened: `spend` was hard-coded to SHARD and
+         * nothing in this suite could see it.
+         *
+         * Modelled from `ledger/src/migrations.ts` migration 13 and NOT from the same constant the
+         * production code reads. That is deliberate — a fake that shared the source would agree
+         * with a mistake in it, and the value of this check is that it is the OTHER side of the
+         * boundary, stated independently.
+         * ══════════════════════════════════════════════════════════════════════════════════════
+         */
+        const ACQUISITION_KINDS = new Set(['purchase', 'subscription_charge', 'deposit_credited'])
+        const RETIRED = new Set(['SHARD'])
+        if (ACQUISITION_KINDS.has(request.kind)) {
+          for (const posting of request.postings) {
+            if (RETIRED.has(posting.assetCode)) {
+              throw new LedgerRefusedError(
+                400,
+                'retired_asset',
+                `${posting.assetCode} is retired and may not denominate a ${request.kind}`,
+              )
+            }
+          }
+        }
         keys.push(request.idempotencyKey)
         const replay = claim(request.idempotencyKey, request)
         if (replay) return { ...(replay.response as PostedEntry), replayed: true }
@@ -170,6 +207,28 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
         // Applied in the account's own normal direction, which for a liability is credit-positive
         // and for an asset is debit-positive — `normalBalance` in contracts-money.
         for (const posting of request.postings) {
+          /*
+           * A POSTING'S DECLARED ASSET AND ITS ACCOUNT'S ASSET MUST BE THE SAME ASSET.
+           *
+           * The ledger's account key is `(subject, asset_code, purpose)` and is unique, so these
+           * two fields are not a duplication — one selects the ACCOUNT and the other denominates
+           * the AMOUNT. A posting where they disagree debits an EMBER account by a number the entry
+           * calls SHARD: `balanceEntry` still balances (it sums per declared asset), the account
+           * still exists, and the resulting balance is a quantity in no unit at all.
+           *
+           * This fake used to move balances by `posting.assetCode` alone and never look at
+           * `posting.account.assetCode`, so a mutation that changed only the account's asset was
+           * invisible to every test. That is the check-that-cannot-fail shape, in the test double
+           * rather than in the code.
+           */
+          if (posting.assetCode !== posting.account.assetCode) {
+            throw new LedgerRefusedError(
+              400,
+              'asset_mismatch',
+              `posting ${posting.sequence} is denominated in ${posting.assetCode} but names a ` +
+                `${posting.account.assetCode} account`,
+            )
+          }
           const increases =
             posting.account.type === 'asset' || posting.account.type === 'expense'
               ? posting.direction === 'debit'
@@ -202,6 +261,7 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
           recordedAt: response.recordedAt,
           fingerprint: fingerprint(request),
           response,
+          postings: request.postings,
         }
         entries.push(entry)
         byKey.set(request.idempotencyKey, entry)
