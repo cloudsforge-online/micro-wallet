@@ -27,6 +27,7 @@ import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
+import { indexerObservability } from './observability.ts'
 import { pendingCredits, type DepositDeps } from './deposits.ts'
 import { unwatchedAssignments } from './deposits.ts'
 import type { MoneyDeps } from './money.ts'
@@ -172,6 +173,10 @@ const deposits: DepositDeps = {
   custody,
   indexer,
   ledger,
+  // Measured from the indexer per request (cached 60s), never asserted from a list here. See
+  // `observability.ts`: a second hardcoded list of supported chains is how the estate came to offer
+  // a real Bitcoin address that nothing was watching.
+  observability: indexerObservability({ indexer }),
 }
 
 const withdrawals: WithdrawalDeps = {

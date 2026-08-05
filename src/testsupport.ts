@@ -45,6 +45,7 @@ import type { WithdrawalDeps } from './withdrawals.ts'
 import { CustodyRefusedError, custodyKeyUrn } from './custodyclient.ts'
 import type { CustodyAddress, CustodyClient, CreateAddressRequest } from './custodyclient.ts'
 import type { ActivityPage, IndexerClient, ObservedActivity } from './indexerclient.ts'
+import { indexerObservability } from './observability.ts'
 import {
   LedgerRefusedError,
   type LedgerBalance,
@@ -462,16 +463,50 @@ export interface FakeIndexer extends IndexerClient {
   readonly watched: ReadonlyArray<{ chain: ChainId; network: Network; address: string }>
   setActivity(address: string, items: readonly ObservedActivity[]): void
   failNext(err: Error): void
+  /**
+   * How many providers this fake reports for a scope. **Defaults to one for EVERY chain**, which
+   * keeps every existing test meaning what it meant — they were written against an indexer that
+   * was assumed to watch whatever it was handed. A test that cares sets it to zero.
+   */
+  setProviders(chain: ChainId, network: Network, providers: number): void
+  /** Fail the next `chainStatus` read. Separate from `failNext`, which fails a `watch`. */
+  failStatusNext(err: Error): void
 }
 
 export function fakeIndexer(): FakeIndexer {
   const watched: Array<{ chain: ChainId; network: Network; address: string }> = []
   const activity = new Map<string, readonly ObservedActivity[]>()
+  const providers = new Map<string, number>()
   let pendingFailure: Error | null = null
+  let statusFailure: Error | null = null
   return {
     watched,
     setActivity(address, items) {
       activity.set(address.toLowerCase(), items)
+    },
+    setProviders(chain, network, count) {
+      providers.set(`${chain}:${network}`, count)
+    },
+    failStatusNext(err) {
+      statusFailure = err
+    },
+    async chainStatus(chain, network) {
+      // Deliberately does NOT consume `failNext`. That hook exists to make a WATCH registration
+      // fail so the repair job can be exercised, and a status read that swallowed it would turn
+      // "the indexer refused to watch this address" into "this chain is not observable" — two
+      // different faults with two different repairs.
+      if (statusFailure) {
+        const err = statusFailure
+        statusFailure = null
+        throw err
+      }
+      return {
+        chain,
+        network,
+        providers: providers.get(`${chain}:${network}`) ?? 1,
+        indexedHeight: 1,
+        halted: false,
+      }
     },
     failNext(err) {
       pendingFailure = err
@@ -624,7 +659,15 @@ export function harness(
     custody,
     indexer,
     pricing,
-    deposits: { sql: db, producer: 'wallet', network, custody, indexer, ledger },
+    deposits: {
+      sql: db,
+      producer: 'wallet',
+      network,
+      custody,
+      indexer,
+      ledger,
+      observability: indexerObservability({ indexer, ttlMs: 0 }),
+    },
     withdrawals: {
       sql: db,
       producer: 'wallet',

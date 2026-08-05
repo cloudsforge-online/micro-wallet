@@ -50,6 +50,7 @@ import { canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts
 import { uuidv7 } from './ids.ts'
 import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
+import type { ChainObservability } from './observability.ts'
 import type { LedgerClient } from './ledgerclient.ts'
 import {
   DEPOSIT_ADDRESS_ASSIGNED,
@@ -136,6 +137,11 @@ export interface DepositDeps {
   readonly custody: CustodyClient
   readonly indexer: IndexerClient
   readonly ledger: LedgerClient
+  /**
+   * Whether this estate can SEE the chain an address would be on. See `observability.ts` — an
+   * address nothing watches is money that disappears with no error on either side.
+   */
+  readonly observability: ChainObservability
 }
 
 /* ------------------------------------------------------------------ assignment */
@@ -146,6 +152,43 @@ export interface AssignInput {
   readonly correlationId: string
   /** Forces a new assignment even though an active one exists. See `rotate`. */
   readonly rotate?: boolean
+}
+
+/**
+ * **Refuse a deposit address for an asset this estate cannot observe.**
+ *
+ * `503`, not `400`: nothing about the request is malformed, and the answer changes the moment an
+ * operator configures a provider — which is what a 5xx says and a 4xx does not. The message names
+ * the asset and says the state is temporary, because from the person's side that is the whole of
+ * what is true and actionable; which chains an indexer follows is not their problem to solve.
+ *
+ * `not_followed` and `unknown` are separated on the WIRE, not just in the log. They are different
+ * facts — "this estate does not support that yet" versus "we could not confirm it right now" — and
+ * a support conversation that cannot tell them apart is one where "try again later" is advice for
+ * one of them and a lie for the other.
+ */
+async function assertObservable(
+  deps: DepositDeps,
+  chain: ChainId,
+  assetCode: string,
+): Promise<void> {
+  const observation = await deps.observability.observe(chain, deps.network)
+  if (observation.observable) return
+  if (observation.reason === 'unknown') {
+    throw new DepositError(
+      'observability_unknown',
+      `we could not confirm that ${assetCode} deposits are being watched right now, so no address ` +
+        'has been issued. Nothing is wrong with your account — please try again shortly.',
+      503,
+    )
+  }
+  throw new DepositError(
+    'asset_not_observable',
+    `${assetCode} deposits are not available on this deployment yet. An address would be real and ` +
+      'nothing would be watching it, so anything sent to it would not be credited — which is why ' +
+      'none has been issued.',
+    503,
+  )
 }
 
 /**
@@ -172,6 +215,11 @@ export async function assignDepositAddress(
       400,
     )
   }
+
+  // BEFORE the find-or-create, deliberately. The harm is SHOWING somebody an address to send to,
+  // and an address that already exists is exactly as unwatched as one minted now — so a chain that
+  // stopped being observable must stop being handed out, not merely stop being minted.
+  await assertObservable(deps, chain, assetCode)
 
   if (!input.rotate) {
     const existing = await activeAssignment(deps.sql, input.userId, assetCode, deps.network)

@@ -106,6 +106,61 @@ test('SHARD has no chain, so a deposit address for it is refused rather than inv
   )
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **AN ADDRESS NOTHING WATCHES IS WORSE THAN NO ADDRESS AT ALL.**
+ *
+ * `custody/src/hd.ts` derives a genuine BIP-84 Bitcoin address, and `micro-indexer` follows one
+ * chain per estate (`INDEXER_CHAINS=ember:mainnet`, measured on the running container). So a user
+ * could be shown a real address, send real BTC to it, and nothing would observe, credit or display
+ * it — the key is in custody so the coins are recoverable by a human, but from their side the money
+ * vanishes with no error and from the estate's side there is no record it arrived.
+ *
+ * The refusal is derived from what the indexer reports, never from a list here: a second hardcoded
+ * list of supported chains is precisely how the estate came to offer that address, because
+ * `explorer-web` had one and the indexer disagreed with it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('refuses a deposit address for a chain this estate cannot observe', { skip }, async () => {
+  h.indexer.setProviders('btc', 'testnet', 0)
+  await assert.rejects(
+    () => assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' }),
+    (err: unknown) =>
+      err instanceof Error &&
+      /not available on this deployment yet/.test(err.message) &&
+      /nothing would be watching it/.test(err.message),
+  )
+  // Nothing was minted and nothing was filed. A refusal that still burned a custody key would leave
+  // an address nobody was told about and a row this service would have to reconcile later.
+  assert.equal(h.custody.minted.length, 0)
+  const rows = await sql`select count(*)::int as n from deposit_address_assignments`
+  assert.equal(rows[0]!.n, 0)
+})
+
+test('opens the moment the indexer reports a provider, with no code change', { skip }, async () => {
+  h.indexer.setProviders('btc', 'testnet', 0)
+  await assert.rejects(() => assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' }))
+  // What an operator configuring a provider looks like from here. No redeploy, no allowlist edit.
+  h.indexer.setProviders('btc', 'testnet', 1)
+  const assignment = await assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' })
+  assert.equal(assignment.chain, 'btc')
+})
+
+/**
+ * The gate runs BEFORE the find-or-create, and that ordering is the substance rather than a detail.
+ * An address issued yesterday is exactly as unwatched today as one minted now, so a chain that
+ * stops being observable has to stop being HANDED OUT and not merely stop being minted.
+ */
+test('stops handing out an address that already exists once the chain stops being watched', { skip }, async () => {
+  const issued = await assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' })
+  assert.ok(issued.address)
+  h.indexer.setProviders('btc', 'testnet', 0)
+  await assert.rejects(
+    () => assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' }),
+    /not available on this deployment yet/,
+  )
+})
+
 test('THE RULE: a rotation is a NEW assignment, and the old address still credits', { skip }, async () => {
   // forge-pay mutates the address on the existing row, and because the same row carries the
   // observed high-water mark, the new address starts below it: every probe afterwards reports a

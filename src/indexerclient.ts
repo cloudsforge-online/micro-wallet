@@ -90,7 +90,34 @@ export interface ActivityPage {
   readonly nextCursor: string | null
 }
 
+/**
+ * What the indexer says about ONE chain on ONE network.
+ *
+ * Narrowed to the three fields this service acts on. `micro-indexer`'s `/v1/chains/:c/:n/status`
+ * answers a good deal more — reorg history, lag, per-provider latency — and none of it is a
+ * decision wallet makes, so none of it is typed here. Additive on the far side by contract.
+ */
+export interface ChainStatus {
+  readonly chain: ChainId
+  readonly network: Network
+  /**
+   * **How many sources the indexer has for this chain, and the whole of what "observable" means.**
+   *
+   * `listProviderHealth` returns a row per configured provider, so this is empty exactly when the
+   * indexer follows no source for this scope — which on the estate today is every chain but EMBER,
+   * because `INDEXER_CHAINS` names one. It is the right discriminator rather than `indexedHeight`,
+   * which is also null for a chain that was configured a minute ago and has not caught up: refusing
+   * on that would make a newly-added chain unusable until its first block landed.
+   */
+  readonly providers: number
+  readonly indexedHeight: number | null
+  /** The follower has stopped on purpose. A configured chain that is not currently advancing. */
+  readonly halted: boolean
+}
+
 export interface IndexerClient {
+  /** Read-only, and never throws for "this chain is not followed" — that is an ANSWER. */
+  chainStatus(chain: ChainId, network: Network): Promise<ChainStatus>
   watch(chain: ChainId, network: Network, address: string, label: string | null): Promise<void>
   activity(
     chain: ChainId,
@@ -118,6 +145,24 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
   })
 
   return {
+    async chainStatus(chain, network) {
+      try {
+        const body = await client.get<RawChainStatus>(`/v1/chains/${chain}/${network}/status`)
+        return {
+          chain,
+          network,
+          // `?? []` rather than a throw: an older indexer that does not send the field must not
+          // make every chain unobservable, and a LENGTH of zero is then the honest reading of
+          // "it did not tell us it had one".
+          providers: Array.isArray(body?.providers) ? body.providers.length : 0,
+          indexedHeight: typeof body?.indexedHeight === 'number' ? body.indexedHeight : null,
+          halted: body?.halted === true,
+        }
+      } catch (err) {
+        throw translate(err)
+      }
+    },
+
     async watch(chain, network, address, label) {
       try {
         await client.request(
@@ -153,6 +198,12 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
       }
     },
   }
+}
+
+interface RawChainStatus {
+  readonly providers?: readonly unknown[]
+  readonly indexedHeight?: number | null
+  readonly halted?: boolean
 }
 
 interface RawActivityPage {
