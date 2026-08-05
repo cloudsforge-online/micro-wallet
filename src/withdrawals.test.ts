@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { AddressError } from './addresses.ts'
 import { assignDepositAddress } from './deposits.ts'
+import { readPortfolio } from './portfolio.ts'
 import { createChallenge, grantAuthorisation, verifyChallenge } from './links.ts'
 import { SETTLEMENT_CONFIRMED, SETTLEMENT_FAILED } from './settlement.ts'
 import {
@@ -456,6 +457,55 @@ test('the stuck sweep moves an overdue withdrawal once and tells somebody', { sk
   assert.equal(events.length, 1)
   // The money is still held, because the payment may have landed.
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'reserved'), AMOUNT)
+})
+
+/**
+ * #221, from the balance's end: the held amount must READ as held.
+ *
+ * The notification half of that defect told a user "Nothing has left your balance" while a stuck
+ * withdrawal was holding it. The sentence was only believable because a reader who then checked
+ * their balance had to be shown the truth — so this pins the property the corrected wording now
+ * points at: `available` and `reserved` are two numbers, they differ by exactly the amount in
+ * flight, and nothing sums them into one figure that would make held money look spendable.
+ *
+ * The split is two ACCOUNTS, not two columns (04-domain-model §2.1), which is why this is a
+ * property of the portfolio read and not of a formatting helper.
+ */
+test('a stuck withdrawal shows as reserved, and never as available', { skip }, async () => {
+  const funded = 10n * ONE_EMBER
+  h.ledger.credit(`user:${USER}`, 'EMBER', funded)
+  const { withdrawal } = await request()
+  await sql`update withdrawals set updated_at = now() - interval '2 hours' where id = ${withdrawal.id}`
+  assert.equal(await sweepStuck(h.withdrawals), 1)
+  assert.equal((await findWithdrawal(sql as never, withdrawal.id))?.state, 'stuck')
+
+  const portfolio = await readPortfolio(h.portfolio, { userId: USER })
+  const rows = portfolio.balances.filter((b) => b.assetCode === 'EMBER')
+  const available = rows.find((b) => b.purpose === 'available')
+  const reserved = rows.find((b) => b.purpose === 'reserved')
+
+  // Two rows, each naming what it is. A single collapsed figure is the shape that lets held money
+  // be read as spendable, and it is what the mail's old wording assumed.
+  assert.ok(available, 'no available row')
+  assert.ok(reserved, 'the held amount is invisible in the portfolio')
+  assert.notEqual(available.purpose, reserved.purpose)
+
+  // The reserved figure is the requested amount. The fee comes OUT of it rather than on top, so a
+  // user can always withdraw their whole balance — the reservation is exactly what was asked for.
+  const held = AMOUNT
+  assert.equal(reserved.amount, held.toString())
+  assert.notEqual(reserved.amount, '0')
+  // And available EXCLUDES it. This is the assertion the false sentence contradicted: the money
+  // did leave the available balance, at request time, and going stuck did not give it back.
+  assert.equal(available.amount, (funded - held).toString())
+  assert.notEqual(available.amount, funded.toString(), 'available still shows the held amount as spendable')
+  assert.notEqual(available.amount, reserved.amount, 'available and reserved must read as different numbers')
+
+  // Smallest units and the decimal rendering are separate fields, and the formatted one is scaled
+  // rather than being the integer restated — #199 is the defect where those two get confused.
+  assert.equal(reserved.amount, '1000000000000000000')
+  assert.equal(reserved.amountFormatted, '1')
+  assert.notEqual(reserved.amountFormatted, reserved.amount)
 })
 
 test('an illegal transition is refused rather than applied', { skip }, async () => {
