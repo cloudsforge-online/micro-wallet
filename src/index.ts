@@ -207,7 +207,9 @@ const server = createServer({
   withdrawals,
   money,
   portfolio,
-  eventSigningSecret: env.outboxSigningSecret,
+  // The ACCEPT list, not the signing key: verification widens for the rotation window, signing
+  // does not. Absent `OUTBOX_ACCEPT_SECRETS` this is `[env.outboxSigningSecret]`, i.e. unchanged.
+  eventSigningSecret: env.outboxAcceptSecrets,
   challengeDomain: env.challengeDomain,
   challengeUri: env.challengeUri,
   challengeTtlSeconds: env.challengeTtlSeconds,

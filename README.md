@@ -77,6 +77,25 @@ WALLET_TEST_DATABASE_URL=postgres://…/wallet_test pnpm test
 service's tables between cases and `node:test` runs *files* in parallel by default. A TRUNCATE
 takes an AccessExclusiveLock, so one file's reset deadlocks against another file's inserts.
 
+### Rotating the outbox secret
+
+| Variable | | |
+| --- | --- | --- |
+| `OUTBOX_SIGNING_SECRET` | required | The key this service **signs** its own outbox deliveries with. One key, always. |
+| `OUTBOX_ACCEPT_SECRETS` | optional | Comma-separated, **newest first**. The keys `POST /events` will **accept**. Defaults to `[OUTBOX_SIGNING_SECRET]`. |
+
+`OUTBOX_SIGNING_SECRET` is one HMAC key shared across the estate, so replacing it is a rolling
+change or it is an outage: the instant a producer's relay adopts the new key, a receiver that
+accepts only the old one answers 401 to every delivery and the relay retries it for ever — deposit
+confirmations and settlement outcomes stop arriving, silently, with a green `/livez`.
+
+`OUTBOX_ACCEPT_SECRETS` is the overlap window. Set it to `new,old`, redeploy the producers, then
+drop `old`. Each entry gets the same checks as the signing secret — no placeholders, at least 24
+characters, and a repeated entry is refused because it makes "which key verified this" ambiguous,
+and that answer is how you know the rotation finished. A delivery that verified under anything but
+the first entry logs `event signed with a superseded secret`: when that line stops, the window can
+be closed. Leaving the variable unset is exactly today's behaviour.
+
 ## Cryptography
 
 Two primitives are hand-rolled, both for the reason `forge-pay/src/keccak.ts` already states:

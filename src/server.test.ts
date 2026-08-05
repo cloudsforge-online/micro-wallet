@@ -97,7 +97,14 @@ interface Rig {
 }
 
 async function withServer(
-  options: { probes?: Probe[]; ready?: boolean; verifier?: Verifier; deposits?: DepositDeps },
+  options: {
+    probes?: Probe[]
+    ready?: boolean
+    verifier?: Verifier
+    deposits?: DepositDeps
+    /** The accepted list. A scalar by default, which is what an unrotated deployment passes. */
+    eventSigningSecret?: string | readonly string[]
+  },
   fn: (rig: Rig) => Promise<void>,
 ): Promise<void> {
   const lifecycle = new Lifecycle({ cacheMs: 0 })
@@ -115,7 +122,7 @@ async function withServer(
     withdrawals: h.withdrawals,
     money: h.money,
     portfolio: h.portfolio,
-    eventSigningSecret: SECRET,
+    eventSigningSecret: options.eventSigningSecret ?? SECRET,
     challengeDomain: DOMAIN,
     challengeUri: URI,
     challengeTtlSeconds: 600,
@@ -807,6 +814,72 @@ test('the retired body-only MAC is refused, so it is not a standing forgery cred
       assert.equal(res.status, 401, `the legacy MAC was accepted under ${Object.keys(headers)[0]}`)
     }
     assert.equal((await sql`select 1 from inbox`).length, 0)
+  })
+})
+
+/**
+ * THE ROTATION PROPERTY.
+ *
+ * `OUTBOX_SIGNING_SECRET` is one HMAC key shared by every service in the estate, and it has to be
+ * replaced. A receiver that accepts exactly one secret makes that impossible to do without an
+ * outage: the instant a producer's relay moves to the new key, every delivery to this intake 401s
+ * and the relay retries it for ever, so deposit confirmations and settlement outcomes stop
+ * arriving while `/livez` stays green — silently, which is the whole problem.
+ *
+ * So the accepted list is exactly what makes a rolling rotation possible, and this is the case
+ * that proves it: the NEW secret is first, and a producer that has not been redeployed yet still
+ * signs with the OLD one. Both must be 200 at the same time. The window closes by an operator
+ * dropping the old entry, and `keyIndex > 0` is the log line that says the window is still open.
+ */
+test('THE ROTATION PROPERTY: a delivery signed with the OLD secret still verifies while the new one is first', { skip }, async () => {
+  const OLD = SECRET
+  const NEW = 'fake-rotated-in-outbox-secret-000'
+  await withServer({ eventSigningSecret: [NEW, OLD] }, async (rig) => {
+    const assigned = await fetch(`${rig.url}/v1/deposits`, {
+      method: 'POST',
+      headers: asUser(),
+      body: JSON.stringify({ assetCode: 'EMBER' }),
+    })
+    const { assignment } = (await assigned.json()) as { assignment: { address: string } }
+
+    // The un-redeployed producer: still on the secret that is being rotated OUT, and not first.
+    const stale = await deliverEvent(
+      rig,
+      {
+        id: 'eeeeeeee-0000-4000-8000-000000000001',
+        topic: INDEXER_DEPOSIT_CONFIRMED,
+        key: 'ember:testnet',
+        payload: depositPayload({ address: assignment.address, txHash: `0x${'11'.repeat(32)}` }),
+      },
+      OLD,
+    )
+    assert.equal(stale.status, 200, 'a producer on the superseded secret was partitioned')
+    assert.equal(((await stale.json()) as { decision: { kind: string } }).decision.kind, 'credited')
+
+    // The redeployed producer, on the new secret, in the same window.
+    const fresh = await deliverEvent(
+      rig,
+      {
+        id: 'eeeeeeee-0000-4000-8000-000000000002',
+        topic: INDEXER_DEPOSIT_CONFIRMED,
+        key: 'ember:testnet',
+        payload: depositPayload({ address: assignment.address, txHash: `0x${'22'.repeat(32)}` }),
+      },
+      NEW,
+    )
+    assert.equal(fresh.status, 200)
+
+    // Widening the list must not widen anything else: a secret that is on neither end is still 401.
+    const forged = await deliverEvent(
+      rig,
+      {
+        id: 'eeeeeeee-0000-4000-8000-000000000003',
+        topic: INDEXER_DEPOSIT_CONFIRMED,
+        payload: depositPayload({ address: assignment.address }),
+      },
+      'fake-secret-nobody-issued-000000',
+    )
+    assert.equal(forged.status, 401)
   })
 })
 

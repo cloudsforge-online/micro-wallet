@@ -114,6 +114,36 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
   return value
 }
 
+/**
+ * The secrets the inbound event route accepts, newest first.
+ *
+ * A LIST, not a value, because rotation without an overlap window means every producer must change
+ * secret in the same instant as this service does, and that instant does not exist during a rolling
+ * deploy. Each entry gets the checks `requiredSecret` applies to one. The same shape as
+ * `devplatform`'s `parseSecretList` and `activity`'s `ACTIVITY_INGEST_SECRETS`.
+ */
+export function parseSecretList(raw: string, name: string): readonly string[] {
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
+  for (const entry of entries) {
+    if (PLACEHOLDERS.has(entry.toLowerCase())) {
+      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
+    }
+    if (entry.length < 24) {
+      throw new EnvError(`${name} entries must each be at least 24 characters`)
+    }
+  }
+  if (new Set(entries).size !== entries.length) {
+    // A duplicated secret in the list makes the "which key verified this" answer ambiguous, and
+    // that answer is what tells an operator whether a rotation has finished.
+    throw new EnvError(`${name} lists the same secret twice`)
+  }
+  return Object.freeze(entries)
+}
+
 function boolean(source: Source, name: string, fallback: boolean): boolean {
   const raw = source[name]?.trim().toLowerCase()
   if (!raw) return fallback
@@ -137,6 +167,28 @@ export interface Env {
   readonly identityIssuer: string
   /** HMAC key for outbound event signatures, so a subscriber can prove an event came from us. */
   readonly outboxSigningSecret: string
+
+  /**
+   * The secrets `POST /events` ACCEPTS, newest first. Signing stays on the single key above.
+   *
+   * `OUTBOX_SIGNING_SECRET` is one HMAC key shared by every service in the estate, and replacing it
+   * is only possible as a rolling change if each receiver holds more than one candidate for the
+   * length of the cutover. With one, the instant a producer's relay adopts the new key every
+   * delivery here answers 401 and the relay retries it for ever — so deposit confirmations and
+   * settlement outcomes stop arriving while `/livez` stays green. That is the failure this exists
+   * to make impossible, and it is silent, which is why the window has to be configurable rather
+   * than coordinated.
+   *
+   * `OUTBOX_ACCEPT_SECRETS` is OPTIONAL and defaults to `[OUTBOX_SIGNING_SECRET]`, so a deployment
+   * that has not been given it behaves exactly as it does today. That is deliberate: it makes
+   * shipping this a no-op, which is what lets the rotation itself be staged one service at a time.
+   *
+   * `verifyDelivery` reports `keyIndex`, and `handleEvent` logs any index above zero. That line is
+   * the countdown: when it stops appearing, every producer has moved and the operator can drop the
+   * retired entry from the list.
+   */
+  readonly outboxAcceptSecrets: readonly string[]
+
   readonly instanceId: string
 
   /**
@@ -298,6 +350,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     throw new EnvError(`WALLET_NETWORK must be mainnet or testnet (got ${network})`)
   }
 
+  // Read before the literal below, because the accept list defaults to it. Note the order: the
+  // signing secret is validated first, so a deployment with a bad one is told about THAT rather
+  // than about a list it never set.
+  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
@@ -309,7 +366,12 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'WALLET_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret,
+    // Absent means "accept exactly what we sign with", which is today's behaviour precisely.
+    outboxAcceptSecrets: parseSecretList(
+      optional(source, 'OUTBOX_ACCEPT_SECRETS', outboxSigningSecret),
+      'OUTBOX_ACCEPT_SECRETS',
+    ),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
     network,
     ledgerUrl: required(source, 'LEDGER_URL'),

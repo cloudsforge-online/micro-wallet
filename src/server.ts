@@ -132,8 +132,20 @@ export interface ServerDeps {
   readonly withdrawals: WithdrawalDeps
   readonly money: MoneyDeps
   readonly portfolio: PortfolioDeps
-  /** Verifies the HMAC on inbound events. The same secret the producing service signs with. */
-  readonly eventSigningSecret: string
+  /**
+   * Verifies the HMAC on inbound events — the secrets a producing service may have signed with.
+   *
+   * A LIST as well as a scalar, and the list is the point: `OUTBOX_SIGNING_SECRET` is one key
+   * shared across the estate, and it can only be replaced by a rolling change if a receiver
+   * accepts both the outgoing and the incoming key for the length of the cutover. Accepting one
+   * means the instant a producer's relay moves, every delivery 401s and the relay retries for
+   * ever — a partition with a green `/livez`. A scalar still behaves exactly as it always has;
+   * `env.outboxAcceptSecrets` is what production passes.
+   *
+   * The array goes STRAIGHT into `verifyDelivery` rather than being looped over here, so the
+   * timing-safe comparison and the freshness window stay in the contract where they are tested.
+   */
+  readonly eventSigningSecret: string | readonly string[]
   readonly challengeDomain: string
   readonly challengeUri: string
   readonly challengeTtlSeconds: number
