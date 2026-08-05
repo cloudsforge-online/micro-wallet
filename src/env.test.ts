@@ -204,6 +204,63 @@ test('a malformed fee table is refused at boot rather than at the first withdraw
   assert.throws(() => parseFeeQuotes('{"EMBER":"-1"}'), EnvError)
 })
 
+/*
+ * ── #213: a fee quote must carry its asset's scale ────────────────────────────────────────────
+ *
+ * The four tests below are the guard described in #213, and each one is a failure that reached
+ * the live money path before it: the parser checked that a value was a non-negative integer and
+ * never checked WHICH ASSET it was an integer of.
+ */
+
+test('a fee quoted at another asset’s scale is refused — Litecoin is 8 decimals, not 18', () => {
+  // THE EXACT EDIT THIS GUARD EXISTS FOR. The live table is `{"EMBER":"21000000000000"}`, and the
+  // obvious way to add Litecoin is to copy that line. At EMBER's 18 decimals it is 0.000021 EMBER;
+  // at Litecoin's 8 it is 210,000 LTC, a factor of 10^10 out. Both are "a non-negative integer",
+  // which is every question the parser used to ask.
+  assert.throws(
+    () => parseFeeQuotes('{"EMBER":"21000000000000","LTC":"21000000000000"}'),
+    EnvError,
+    'an EMBER-shaped literal keyed to LTC must not parse',
+  )
+
+  // The same number, correctly scaled, is fine — the bound is asset-relative and not a blanket cap.
+  const parsed = parseFeeQuotes('{"EMBER":"21000000000000","LTC":"10000"}')
+  // ASSERTED AS AN EXACT INTEGER IN SMALLEST UNITS, which is the only form that can catch an
+  // exponent error: 10000 litoshis is 0.0001 LTC. A test that asserted "about right" or compared
+  // a formatted string would pass on all ten wrong answers.
+  assert.equal(parsed['LTC'], 10_000n)
+  assert.equal(typeof parsed['LTC'], 'bigint')
+  assert.equal(parsed['EMBER'], 21_000_000_000_000n)
+})
+
+test('an empty string is not a fee of zero — BigInt(‘’) is 0n', () => {
+  // `''` is a string, so the typeof check passed; `BigInt('')` does not throw, so the try passed;
+  // `0n < 0n` is false, so the negative check passed. A free withdrawal, paid by the treasury,
+  // with no error anywhere. Measured: node prints `0n`.
+  assert.equal(BigInt(''), 0n, 'the language behaviour this test exists to defend against')
+  assert.throws(() => parseFeeQuotes('{"LTC":""}'), EnvError)
+  assert.throws(() => parseFeeQuotes('{"LTC":"   "}'), EnvError)
+
+  // An explicit zero is refused too. Waiving the network fee is a decision somebody makes on
+  // purpose; it must never be what a malformed value degrades into.
+  assert.throws(() => parseFeeQuotes('{"LTC":"0"}'), EnvError)
+})
+
+test('an unknown asset code is refused, rather than quoting a coin that does not exist', () => {
+  // Fail-closed on absence means a typo does not lose money — it presents as "Litecoin withdrawals
+  // are refused" beside a table that visibly contains a Litecoin line. Cheap to prevent, expensive
+  // to debug.
+  assert.throws(() => parseFeeQuotes('{"LTCC":"10000"}'), EnvError)
+  assert.throws(() => parseFeeQuotes('{"ltc":"10000"}'), EnvError, 'the union is upper case')
+})
+
+test('a retired asset may not be quoted a network fee', () => {
+  // SHARD has `decimals: 0` and never settled on a chain. It is nameable and un-withdrawable, and
+  // those are separate questions — the same split `foresight/src/stakeassets.ts` draws between
+  // `CHAIN_DECIMALS` membership and `isRetiredAsset`.
+  assert.throws(() => parseFeeQuotes('{"SHARD":"1"}'), EnvError)
+})
+
 test('withdrawals can be paused by configuration', () => {
   assert.equal(loadEnv({ ...BASE, WALLET_WITHDRAWALS_ENABLED: 'false' }).withdrawalsEnabled, false)
   assert.equal(loadEnv({ ...BASE, WALLET_WITHDRAWALS_ENABLED: '0' }).withdrawalsEnabled, false)

@@ -25,7 +25,13 @@
  */
 
 import { hostname } from 'node:os'
-import type { Network } from '@cloudsforge/contracts-chain'
+import {
+  CHAINS,
+  chainSpec,
+  isRetiredAsset,
+  type AssetCode,
+  type Network,
+} from '@cloudsforge/contracts-chain'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -303,6 +309,29 @@ export interface Env {
  *
  * Values are converted with `BigInt`, never `Number`: an EVM fee routinely exceeds
  * `Number.MAX_SAFE_INTEGER`, and a float here would round the number a withdrawal is priced at.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **A NUMBER HERE IS MEANINGLESS WITHOUT THE ASSET IT IS DENOMINATED IN — #213.**
+ *
+ * This function used to ask four questions: is the JSON an object, is the value a string or a
+ * number, does `BigInt()` accept it, and is it non-negative. All four are questions about a
+ * NUMBER. None of them is a question about the ASSET, and a fee is not a number — it is a number
+ * at a scale, and the scale is a property of the chain.
+ *
+ * The live table is `{"EMBER":"21000000000000"}`. The obvious way to add Litecoin is to copy that
+ * line. At EMBER's 18 decimals it is 0.000021 EMBER; at Litecoin's 8 it is **210,000 LTC**, a
+ * factor of 10¹⁰. The old parser accepted it without a word, because "21000000000000" is a
+ * perfectly good non-negative integer.
+ *
+ * So the asset is now looked up rather than assumed, and `@cloudsforge/contracts-chain` — which
+ * was already imported here, but as a TYPE ONLY, so its decimals table was not in scope — is the
+ * authority for all three of the checks below. This follows `chainTokenAssetCode()` in
+ * `micro-contracts@c272a33`: when the scale of a value cannot be established, throw rather than
+ * guess. `micro-foresight`'s `stakeAssetDecimals` draws the same line one service over.
+ *
+ * Every failure here is a BOOT failure, which is the cheapest place in the system to catch it —
+ * the alternative is discovering it when a user's withdrawal is priced.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export function parseFeeQuotes(raw: string): Readonly<Record<string, bigint>> {
   let parsed: unknown
@@ -318,8 +347,36 @@ export function parseFeeQuotes(raw: string): Readonly<Record<string, bigint>> {
   }
   const out: Record<string, bigint> = {}
   for (const [asset, value] of Object.entries(parsed as Record<string, unknown>)) {
+    // ── 1. The key must name an asset this estate has a chain spec for ────────────────────────
+    //
+    // Read off `CHAINS`, whose keys ARE the `AssetCode` union, so a chain added upstream is
+    // quotable here without an edit and one removed upstream stops being quotable. A typo like
+    // `LTCC` or a lower-case `ltc` used to install a quote for a coin that does not exist while
+    // the real asset stayed absent and was refused — which does not lose money, because absence
+    // is fail-closed, but presents as "Litecoin withdrawals are refused" beside a table that
+    // visibly contains a Litecoin line.
+    if (!Object.hasOwn(CHAINS, asset)) {
+      throw new EnvError(`WALLET_FEE_QUOTES.${asset} is not an asset code this estate knows`)
+    }
+    const code = asset as AssetCode
+    // A retired asset is nameable and un-withdrawable, and those are separate questions. SHARD
+    // never settled on a chain; quoting it a network fee is a category error, and its `decimals:
+    // 0` would make the bound below say something confusing rather than something true.
+    if (isRetiredAsset(code)) {
+      throw new EnvError(`WALLET_FEE_QUOTES.${asset} is retired and cannot be withdrawn`)
+    }
+
     if (typeof value !== 'string' && typeof value !== 'number') {
       throw new EnvError(`WALLET_FEE_QUOTES.${asset} must be a decimal string`)
+    }
+    // ── 2. `BigInt('') === 0n`, so an empty value must be refused BEFORE the coercion ─────────
+    //
+    // `''` is a string, so the check above passes. `BigInt('')` does not throw, so the `try`
+    // below passes. `0n < 0n` is false, so the sign check passes. The result was a fee of zero —
+    // free withdrawals, paid out of the treasury, with no error raised anywhere. `BigInt` also
+    // accepts a whitespace-only string, so the test is on the trimmed value.
+    if (typeof value === 'string' && value.trim() === '') {
+      throw new EnvError(`WALLET_FEE_QUOTES.${asset} is empty, which BigInt would read as zero`)
     }
     let fee: bigint
     try {
@@ -328,6 +385,36 @@ export function parseFeeQuotes(raw: string): Readonly<Record<string, bigint>> {
       throw new EnvError(`WALLET_FEE_QUOTES.${asset} is not an integer: ${String(value)}`)
     }
     if (fee < 0n) throw new EnvError(`WALLET_FEE_QUOTES.${asset} must not be negative`)
+    // Waiving the network fee is a decision an operator makes on purpose. It must never be the
+    // thing a malformed value degrades into, so zero is refused here and would have to be
+    // introduced deliberately, with its own name, if it were ever wanted.
+    if (fee === 0n) {
+      throw new EnvError(`WALLET_FEE_QUOTES.${asset} is zero — a free withdrawal is not a default`)
+    }
+
+    // ── 3. The magnitude must be plausible AT THIS ASSET'S SCALE ─────────────────────────────
+    //
+    // One whole unit of the asset is the bound: `10 ** decimals`. A network fee of an entire coin
+    // is not a network fee on any chain this estate speaks, and the figure is derived from the
+    // chain spec rather than written down, so it is right for an 8-decimal chain and an
+    // 18-decimal one without either being special-cased.
+    //
+    // It catches the exponent error in the direction it actually happens. Copying EMBER's
+    // 21000000000000 onto LTC gives 21000000000000 ≥ 10⁸ and throws. It is deliberately a loose
+    // bound and not a tight one — a tight bound would need a live fee estimate, which is exactly
+    // the thing this table is an interim for, and would turn a fee spike into an outage.
+    //
+    // Note what this does NOT catch: a fee 10¹⁰ too SMALL still parses, because a small fee is
+    // indistinguishable from a cheap chain. That direction is caught downstream by
+    // `withdrawalMinFeeMultiple` and by the treasury reconciling short, not here.
+    const oneWholeUnit = 10n ** BigInt(chainSpec(code).decimals)
+    if (fee >= oneWholeUnit) {
+      throw new EnvError(
+        `WALLET_FEE_QUOTES.${asset} is ${fee}, which is at least one whole ${asset} at ` +
+          `${chainSpec(code).decimals} decimals — that is an amount, not a network fee, and is ` +
+          `usually a figure copied from an asset with a different number of decimals`,
+      )
+    }
     out[asset] = fee
   }
   return out
