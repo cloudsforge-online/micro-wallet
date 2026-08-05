@@ -33,6 +33,25 @@
  * by design. A family whose checksum is not implemented would have to be accepted on length alone,
  * and an address accepted on length alone is a withdrawal sent into the void. There is no such
  * family here.
+ *
+ * ## A FAMILY IS NOT A CHAIN, AND FOR THE BITCOIN FAMILY THAT DISTINCTION IS MONEY
+ *
+ * `familyOf('ltc')` is `'bitcoin'`, and it is right to be: Litecoin genuinely shares Bitcoin's
+ * transaction structure, its script language and its address ENCODINGS. What it does not share is
+ * the PARAMETERS those encodings are applied with — a different bech32 human-readable part and
+ * different base58 version bytes — so a validator that switches on the family alone answers
+ * Bitcoin's rules for Litecoin and accepts a `bc1…` address as a Litecoin withdrawal destination.
+ *
+ * That failure is silent in every way a failure can be. The address is well-formed, its checksum is
+ * valid, nothing throws, the withdrawal is reserved, signed and broadcast — and the coins land in a
+ * Litecoin output nobody holds the key to. It is the same defect custody found on the derivation
+ * side (`custody/src/chains.ts`, `bitcoinNetwork`), one repository later and pointing outward
+ * instead of inward.
+ *
+ * So `canonicaliseBitcoinFamily` takes the CHAIN, the parameters are a table keyed by chain, and an
+ * unknown bitcoin-family chain THROWS rather than falling back to Bitcoin's. A default there is the
+ * bug, not a convenience: the next Bitcoin-derived chain added to `ChainId` would silently accept
+ * Bitcoin addresses under its own name and nothing would fail until somebody sent money.
  */
 
 import { createHash } from 'node:crypto'
@@ -51,9 +70,16 @@ import { keccak256 } from './keccak.ts'
  * `shard` is deliberately absent: SHARD is in `CHAINS` only so that record is total, it never
  * exists on a chain, and a deposit address for it could only ever be a lie.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp'
+export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
 
-export const CHAIN_IDS: readonly ChainId[] = Object.freeze(['ember', 'eth', 'btc', 'sol', 'xrp'])
+export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
+  'ember',
+  'eth',
+  'btc',
+  'sol',
+  'xrp',
+  'ltc',
+])
 
 const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   ember: 'EMBER',
@@ -61,6 +87,7 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   btc: 'BTC',
   sol: 'SOL',
   xrp: 'XRP',
+  ltc: 'LTC',
 })
 
 const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.freeze({
@@ -69,6 +96,7 @@ const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.fr
   BTC: 'btc',
   SOL: 'sol',
   XRP: 'xrp',
+  LTC: 'ltc',
 })
 
 export function isChainId(value: string): value is ChainId {
@@ -91,6 +119,44 @@ export function assetOf(chain: ChainId): AssetCode {
  */
 export function chainForAsset(assetCode: string): ChainId | null {
   return CHAIN_FOR_ASSET[assetCode as AssetCode] ?? null
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE CHAIN NAME CUSTODY STORES, WHICH IS NOT THIS SERVICE'S SLUG — AND THIS SERVICE WAS SENDING
+ * THE SLUG.**
+ *
+ * Found while adding Litecoin, and it is **not a Litecoin defect**: it has been live for ETH, BTC
+ * and SOL since deposit provisioning was built. Custody's `CHAIN_ASSET` is keyed by chain NAME —
+ * `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember` — because those are the values the
+ * rows it adopted from forge-keyvault already carry, and `custody/src/server.ts:691` refuses
+ * anything else with 400 `unknown_chain`. This service's slug is the asset code lowercased.
+ *
+ * The two agree on exactly two of six, `ember` and `xrp`, and disagree on the other four. So
+ * `POST /v1/deposits` for ETH, BTC or SOL has been answering 400 from custody, and **every test
+ * here missed it because `custodycontract.test.ts` only ever exercised `ember`** — the one slug
+ * that happens to equal its own chain name. A contract test that pins one value pins one value.
+ *
+ * `settlement` has had the same table since it was written (`settlement/src/chains.ts`,
+ * `CUSTODY_CHAIN`) with a comment explaining why it is a table rather than a `toLowerCase()`. This
+ * service needed it and did not have it.
+ *
+ * The translation happens at the WIRE, in `httpCustodyClient`, and nowhere else. Everything on this
+ * side of that boundary — the rows, the events, `custodyKeyUrn` — keeps this service's slug, so a
+ * stored `chain` still means what every other query here assumes it means.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
+  ember: 'ember',
+  eth: 'ethereum',
+  btc: 'bitcoin',
+  sol: 'solana',
+  xrp: 'xrp',
+  ltc: 'litecoin',
+})
+
+export function custodyChainOf(chain: ChainId): string {
+  return CUSTODY_CHAIN[chain]
 }
 
 export function familyOf(chain: ChainId): ChainFamily {
@@ -132,7 +198,9 @@ export function canonicaliseAddress(chain: ChainId, raw: string): CanonicalAddre
     case 'ember':
       return canonicaliseEvm(trimmed)
     case 'bitcoin':
-      return canonicaliseBitcoin(trimmed)
+      // THE CHAIN, not the family. See the header: `btc` and `ltc` are both `'bitcoin'` here and
+      // they accept disjoint sets of addresses on mainnet.
+      return canonicaliseBitcoinFamily(chain, trimmed)
     case 'xrp':
       return canonicaliseXrp(trimmed)
     case 'solana':
@@ -264,6 +332,10 @@ function bech32Expand(prefix: string): number[] {
  * bech32's constant 1 and version 1 (Taproot) uses bech32m's 0x2bc830a3. Accepting only one would
  * reject every Taproot address, and accepting either without checking which the witness version
  * calls for would accept an address that a Bitcoin node will not.
+ *
+ * **THE CHECKSUM IS NOT THE ONLY GATE — SEE `assertPayableWitnessVersion`.** This function answers
+ * "is this a well-formed segwit address of any version", which is a different question from "can
+ * this estate pay it", and the two were being conflated.
  */
 function verifyBech32(address: string): void {
   const lower = address.toLowerCase()
@@ -289,17 +361,176 @@ function verifyBech32(address: string): void {
   }
 }
 
-function canonicaliseBitcoin(raw: string): CanonicalAddress {
-  if (/^(bc1|tb1|bcrt1)/i.test(raw)) {
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE BITCOIN-FAMILY NETWORK PARAMETERS. A WRONG ENTRY HERE ACCEPTS AN ADDRESS ON THE WRONG
+ * CHAIN, AND A WITHDRAWAL TO AN ADDRESS ON THE WRONG CHAIN IS GONE.**
+ *
+ * Every value is from the chain's own `src/chainparams.cpp` and each is commented with the address
+ * it produces, so a reader checks it against an address rather than against a memory. They are the
+ * same values custody derives under (`custody/src/chains.ts`, `LITECOIN_MAINNET`) and the same
+ * values settlement builds under, and they have to be: an address this service accepts and
+ * settlement cannot build a payment to is a withdrawal that reserves a user's money and then fails.
+ *
+ * ── WHAT THIS TABLE DELIBERATELY OMITS, AND WHY ───────────────────────────────────────────────
+ *
+ * **Litecoin's `SCRIPT_ADDRESS` of 5 is not here, only `SCRIPT_ADDRESS2` of 50.** Litecoin Core
+ * has two P2SH prefixes: `key_io.cpp` DECODES both 5 (`3…`, byte-identical to Bitcoin's) and 50
+ * (`M…`), and ENCODES only 50. Accepting 5 would mean accepting a string that is simultaneously a
+ * valid Bitcoin mainnet P2SH address and a valid Litecoin one, with nothing in it to say which was
+ * meant — so a user pasting a Bitcoin address into the Litecoin field would be told it is fine.
+ * Refusing it costs the small number of users still holding pre-`M` Litecoin P2SH addresses a
+ * visible error they can act on. That is the safe direction, and it is also the only direction the
+ * rest of the estate can honour: bitcoinjs-lib's Litecoin parameters carry `scriptHash: 0x32`, so
+ * settlement's `toOutputScript` refuses a `3…` address outright and a withdrawal accepted here
+ * would die at build time with the money already reserved.
+ *
+ * ── THE ONE COLLISION THAT IS REAL AND CANNOT BE CLOSED ───────────────────────────────────────
+ *
+ * **On TESTNET, Bitcoin and Litecoin share `PUBKEY_ADDRESS` = 111.** A `m…`/`n…` legacy testnet
+ * address is byte-for-byte both chains' and no validator anywhere can tell them apart — that is a
+ * property of the chains, not of this code, and pretending otherwise would be inventing evidence.
+ * It does not exist on mainnet, where Bitcoin's 0 and Litecoin's 48 are disjoint, and the estate's
+ * testnet carries no value. `addresses.test.ts` asserts the collision explicitly rather than
+ * leaving it to be discovered, because a reader comparing this table against Core will notice the
+ * repeat and needs to know it is deliberate.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+interface BitcoinFamilyParams {
+  /** Lower-cased bech32 human-readable parts, every network. The HRP is inside the checksum. */
+  readonly hrps: readonly string[]
+  /** Accepted base58check version bytes, every network. */
+  readonly versions: readonly number[]
+}
+
+const BITCOIN_FAMILY_PARAMS: Readonly<Record<string, BitcoinFamilyParams>> = Object.freeze({
+  btc: Object.freeze({
+    /** `bc1…` mainnet, `tb1…` testnet and signet, `bcrt1…` regtest. */
+    hrps: Object.freeze(['bc', 'tb', 'bcrt']),
+    /** 0 → `1…`; 5 → `3…`; 111 → `m…`/`n…` testnet; 196 → `2…` testnet. */
+    versions: Object.freeze([0x00, 0x05, 0x6f, 0xc4]),
+  }),
+  ltc: Object.freeze({
+    /** `ltc1…` mainnet, `tltc1…` testnet, `rltc1…` regtest. NOT `bc1`, which is the whole point. */
+    hrps: Object.freeze(['ltc', 'tltc', 'rltc']),
+    /** 48 → `L…`; 50 → `M…` (SCRIPT_ADDRESS2, the one Core encodes); 111 and 58 → testnet. */
+    versions: Object.freeze([0x30, 0x32, 0x6f, 0x3a]),
+  }),
+})
+
+/** Every bitcoin-family HRP in the table, so a wrong-chain address is named rather than guessed. */
+const HRP_OWNER: ReadonlyMap<string, string> = new Map(
+  Object.entries(BITCOIN_FAMILY_PARAMS).flatMap(([chain, params]) =>
+    params.hrps.map((hrp) => [hrp, chain] as const),
+  ),
+)
+
+/**
+ * The parameters for a bitcoin-family chain, or throw.
+ *
+ * **It throws for an unknown chain rather than defaulting to Bitcoin's**, which is the entire
+ * lesson of this file. A default is not a convenience here, it is the defect: the next
+ * Bitcoin-derived chain added to `ChainId` would silently accept `bc1…` addresses under its own
+ * name, every test would stay green, and the first evidence would be a user's missing coins.
+ */
+export function bitcoinFamilyParams(chain: ChainId): BitcoinFamilyParams {
+  const params = BITCOIN_FAMILY_PARAMS[chain]
+  if (!params) {
+    throw new AddressError(
+      `no bitcoin-family address parameters are defined for '${chain}' — refusing to validate it ` +
+        "with another chain's, which would accept a valid address on the wrong chain",
+    )
+  }
+  return params
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ESTATE CANNOT PAY A TAPROOT ADDRESS ON ANY BITCOIN-FAMILY CHAIN, SO THIS SERVICE MUST NOT
+ * ACCEPT ONE. THAT WAS ALREADY TRUE FOR BITCOIN AND NOBODY HAD NOTICED.**
+ *
+ * This was found while adding Litecoin and is NOT a Litecoin defect — it is a live Bitcoin one that
+ * adding Litecoin would have duplicated. `settlement` decodes a destination with
+ * `bitcoinjs-lib@6.1.7`'s `address.toOutputScript`, and for witness version 1 that goes through the
+ * `p2tr` payment, which throws `No ECC Library provided. You must call initEccLib()`. Nothing in
+ * this estate calls `initEccLib` — not settlement, which has no secp256k1 package at all, and not
+ * custody, which has one and never initialises it. So a `bc1p…` destination fails to decode in the
+ * service that builds the transaction AND in the service that signs it.
+ *
+ * Before this check, the sequence for a user withdrawing to a Taproot address was: accepted here,
+ * balance RESERVED through the ledger, row queued, and only then an `AddressError` at build — a
+ * reservation to unwind for an address that was never payable. Refusing at request time costs the
+ * user an immediate, explicable error and costs the estate nothing.
+ *
+ * **THE FIX IS DELIBERATELY THE REFUSAL AND NOT `initEccLib`.** Making Taproot payable means adding
+ * a native secp256k1 binding to settlement's runtime image and initialising it in custody as well,
+ * in the two services that build and sign money movements, to gain a destination FORM rather than a
+ * chain. That is a change to a signing path this service does not own the far side of, and the rule
+ * is to stop at the seam rather than half-wire it. Witness versions 2 and above are refused by the
+ * same clause and for a stronger reason: no chain here has activated one, so an address claiming
+ * one cannot be paid by anybody.
+ *
+ * Deposits are unaffected. Custody derives P2WPKH — witness version 0 — so every address this
+ * estate MINTS is payable; this bounds only where a user may withdraw TO.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+function assertPayableWitnessVersion(address: string): void {
+  const lower = address.toLowerCase()
+  const data = lower.slice(lower.lastIndexOf('1') + 1)
+  const version = BECH32_ALPHABET.indexOf(data[0] ?? '')
+  if (version !== 0) {
+    throw new AddressError(
+      `this is a witness version ${version} address, and this platform can only pay version 0 ` +
+        '(addresses whose data part begins `q`, such as `bc1q…` and `ltc1q…`). Taproot and later ' +
+        'output types are not payable here yet. Withdraw to a version 0 or a legacy address.',
+    )
+  }
+}
+
+function canonicaliseBitcoinFamily(chain: ChainId, raw: string): CanonicalAddress {
+  const params = bitcoinFamilyParams(chain)
+
+  // The HRP is everything before the LAST '1', because '1' is not in the bech32 data alphabet but
+  // may appear in the HRP itself. Same rule as `verifyBech32`, which re-derives it independently.
+  const separator = raw.lastIndexOf('1')
+  const hrp = separator > 0 ? raw.slice(0, separator).toLowerCase() : ''
+  if (params.hrps.includes(hrp)) {
+    // The checksum COMMITS TO THE HRP — `bech32Expand(prefix)` feeds it into the polymod — so this
+    // is not a prefix comparison dressed up as one: the same data part under another HRP fails the
+    // checksum outright. `addresses.test.ts` proves that with BIP-173's own published vector.
     verifyBech32(raw)
+    assertPayableWitnessVersion(raw)
     // Bech32 is defined lowercase; the uppercase form exists only for QR density. Storing the
     // lowercase form for both is what makes the two spellings one address.
     const lower = raw.toLowerCase()
     return { address: lower, key: lower }
   }
+  const foreign = HRP_OWNER.get(hrp)
+  if (foreign) {
+    // A well-formed address on a DIFFERENT chain of this family, which is the one mistake here
+    // that costs money rather than a retry. Named explicitly, because "invalid address" would send
+    // a user looking for a typo in a string that has none.
+    throw new AddressError(
+      `${hrp}1… is a ${foreign.toUpperCase()} address and this is a ${chain.toUpperCase()} ` +
+        'withdrawal. Sending it there would put the coins in an output nobody can spend.',
+    )
+  }
+
   const payload = base58CheckDecode(raw, BITCOIN_ALPHABET)
   // One version byte plus a 20-byte hash. Anything else decoded cleanly but is not an address.
   if (payload.length !== 21) throw new AddressError('address is not a 21-byte base58check payload')
+  const version = payload[0]!
+  if (!params.versions.includes(version)) {
+    // The base58 checksum passed, so the string is a real address — of some other chain. This is
+    // the branch that stops a `1…` Bitcoin address being accepted as a Litecoin destination, and
+    // it is a check the previous version of this function did not make AT ALL: it accepted any
+    // 21-byte payload whatever its version byte, so every Bitcoin address was a valid `btc`
+    // address and would have been a valid `ltc` one the moment `ltc` existed.
+    throw new AddressError(
+      `this address carries version byte ${version}, which is not one ${chain.toUpperCase()} ` +
+        'uses. It is a valid address on another chain, and money sent to it here is lost.',
+    )
+  }
   return { address: raw, key: raw }
 }
 

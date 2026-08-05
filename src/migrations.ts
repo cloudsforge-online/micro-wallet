@@ -34,8 +34,19 @@ import type { Migration } from '@cloudsforge/db'
  * networks." The XRP testnet/mainnet address collision in 00-current-state §3.5 is what happens
  * when that is a convention rather than a constraint.
  */
+/*
+ * **THIS CONSTANT IS FROZEN AT THE FIVE CHAINS MIGRATION 9 SHIPPED WITH, AND MUST STAY THAT WAY.**
+ * `ltc` was added to the service in migration 10 by ALTERing each constraint, not by editing this
+ * string: `@cloudsforge/db` checksums every migration's text and refuses a run where an applied
+ * one changed, so widening the literal here would make every deployment that has already run
+ * migrations 5 to 9 refuse to start. It is the same rule that sent `ledger` to a new migration 14
+ * for its `chain_assets` row rather than back to migration 11.
+ */
 const CHAIN_CK = `check (chain in ('ember','eth','btc','sol','xrp'))`
 const NETWORK_CK = `check (network in ('mainnet','testnet'))`
+
+/** The chains after migration 10. Kept beside the above so the pair is read together. */
+const CHAIN_CK_V10 = `check (chain in ('ember','eth','btc','sol','xrp','ltc'))`
 
 export const MIGRATIONS: readonly Migration[] = [
   {
@@ -431,6 +442,50 @@ export const MIGRATIONS: readonly Migration[] = [
         constraint platform_addresses_purpose_ck
           check (purpose in ('treasury','deployer','sweep','other'))
       );
+    `,
+  },
+  {
+    version: 10,
+    name: 'litecoin',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * Litecoin, in the five places the schema names a chain.
+     *
+     * A NEW MIGRATION AND NOT AN EDIT OF THE OLD ONES, for the reason the header of this file
+     * gives: an applied migration's text is checksummed, so widening `CHAIN_CK` in place would
+     * make `@cloudsforge/db` refuse to run against every database that already has migrations 5
+     * to 9 — which is every deployment that exists. The fix for a constraint that has to change
+     * is always another migration.
+     *
+     * **DROP THEN ADD, AND THE ADD IS VALIDATING.** Postgres cannot widen a check constraint in
+     * place. The add re-scans each table, which is correct rather than merely acceptable here:
+     * these tables hold thousands of rows, not billions, and a `not valid` constraint would leave
+     * the schema claiming a guarantee it had not checked. If one of these tables is ever large
+     * enough for the scan to matter the answer is `not valid` plus a separate `validate
+     * constraint`, and it is not that today.
+     *
+     * `if exists` on each drop so a database provisioned from a future baseline is not broken by
+     * a constraint that was never separately created; the adds are unconditional, because a
+     * missing constraint here is the thing this migration exists to prevent.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table wallets drop constraint if exists wallets_chain_ck;
+      alter table wallets add constraint wallets_chain_ck ${CHAIN_CK_V10};
+
+      alter table deposit_address_assignments
+        drop constraint if exists deposit_address_assignments_chain_ck;
+      alter table deposit_address_assignments
+        add constraint deposit_address_assignments_chain_ck ${CHAIN_CK_V10};
+
+      alter table deposit_credits drop constraint if exists deposit_credits_chain_ck;
+      alter table deposit_credits add constraint deposit_credits_chain_ck ${CHAIN_CK_V10};
+
+      alter table withdrawals drop constraint if exists withdrawals_chain_ck;
+      alter table withdrawals add constraint withdrawals_chain_ck ${CHAIN_CK_V10};
+
+      alter table platform_addresses drop constraint if exists platform_addresses_chain_ck;
+      alter table platform_addresses add constraint platform_addresses_chain_ck ${CHAIN_CK_V10};
     `,
   },
 ]

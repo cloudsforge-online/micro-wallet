@@ -384,6 +384,30 @@ export interface FakeCustody extends CustodyClient {
  * NOT DO THIS: it has no idempotency handling at all and `provisionAddress` mints unconditionally
  * (`custody/src/keys.ts:101`). Do not read a passing retry test here as evidence about the estate.
  */
+/**
+ * Addresses the fake custody mints, per chain.
+ *
+ * ── THE FAKE USED TO MINT `0x…` FOR EVERY CHAIN, WHICH MADE ONE PATH UNTESTABLE ────────────────
+ *
+ * `assignDepositAddress` canonicalises whatever custody hands back, so a fake that answers an EVM
+ * address for a `bitcoin` request cannot get past `canonicaliseAddress` — and the failure looks
+ * like "address contains a character outside its alphabet", which reads as a bug in the code under
+ * test rather than in the fake. The effect was that **no deposit-assignment test existed for any
+ * non-EVM chain at all**, and the first one written found this rather than anything about Litecoin.
+ *
+ * The Litecoin entries are Litecoin Core's own published vectors
+ * (`litecoin/src/test/data/key_io_valid.json`, chain `test`) rather than strings shaped to look
+ * right. A fake that answers a plausible-looking address would let a canonicaliser with the wrong
+ * parameters pass, which is the exact defect these tests exist to catch.
+ */
+const CHAIN_ADDRESSES: Partial<Record<ChainId, readonly string[]>> = {
+  ltc: [
+    'tltc1qpftpsvdn6mjp8celrkj0qxqy4jlapl959rlwg9',
+    'tltc1quf7ycjczjpjd6u9a8mpa00jl7g9aplhy8e0vf7',
+  ],
+  btc: ['tb1qcrh3yqn4nlleplcez2yndq2ry8h9ncg3qh7n54'],
+}
+
 export function fakeCustody(): FakeCustody {
   const minted: CreateAddressRequest[] = []
   const byKey = new Map<string, CustodyAddress>()
@@ -404,7 +428,20 @@ export function fakeCustody(): FakeCustody {
       const existing = byKey.get(request.idempotencyKey)
       if (existing) return existing
       counter += 1
-      const address = `0x${counter.toString(16).padStart(40, 'a')}`
+      // A chain-appropriate address where one is needed, and the EVM shape otherwise — which is
+      // unbounded, where the published-vector pools are not. A pool that runs out throws rather
+      // than wrapping: two assignments sharing an address would violate the unique index and the
+      // resulting failure would point at the schema instead of at this line.
+      const pool = CHAIN_ADDRESSES[request.chain]
+      if (pool && counter > pool.length) {
+        throw new Error(
+          `the fake custody has only ${pool.length} published ${request.chain} addresses and a ` +
+            `${counter}th was asked for — add another from that chain's own test vectors`,
+        )
+      }
+      const address = pool
+        ? (pool[counter - 1] as string)
+        : `0x${counter.toString(16).padStart(40, 'a')}`
       const created: CustodyAddress = {
         custodyKeyUrn: custodyKeyUrn({ chain: request.chain, network: request.network, address }),
         address,

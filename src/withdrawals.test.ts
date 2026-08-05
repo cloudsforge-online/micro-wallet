@@ -1,6 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type postgres from 'postgres'
+import { AddressError } from './addresses.ts'
 import { assignDepositAddress } from './deposits.ts'
 import { createChallenge, grantAuthorisation, verifyChallenge } from './links.ts'
 import { SETTLEMENT_CONFIRMED, SETTLEMENT_FAILED } from './settlement.ts'
@@ -478,4 +479,81 @@ test('an illegal transition is refused rather than applied', { skip }, async () 
     (err: unknown) => err instanceof WithdrawalError && err.code === 'illegal_transition',
   )
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 9n * ONE_EMBER)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * LITECOIN, THROUGH THE WHOLE REQUEST PATH.
+ *
+ * `addresses.test.ts` proves the validator against published vectors. This proves the SERVICE uses
+ * it: the asset gate, the address gate and the database constraint are three separate places that
+ * each had to learn about `ltc`, and a unit test of the validator passes while any of them still
+ * refuses. Migration 10 in particular is invisible to every other test here — `chain = 'ltc'`
+ * violates the check constraint migrations 5 to 9 shipped with, and the row insert is the only
+ * thing that finds out.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** Litecoin Core's own published vector, `src/test/data/key_io_valid.json`, chain `test`. */
+const LTC_DESTINATION = 'tltc1qpftpsvdn6mjp8celrkj0qxqy4jlapl959rlwg9'
+/** Bitcoin Core's, same file. A valid address — on the wrong chain. */
+const BTC_DESTINATION = 'tb1qcrh3yqn4nlleplcez2yndq2ry8h9ncg3qh7n54'
+
+test('LITECOIN: a withdrawal is accepted and the row carries chain ltc', { skip }, async () => {
+  // The fee table is per asset, and LTC was absent from it as well as from the chain map — an
+  // asset with no quote refuses 503 `fee_unavailable` rather than being priced by guessing.
+  const ltc = harness(sql, { fees: { LTC: 200n } })
+  ltc.ledger.credit(`user:${USER}`, 'LTC', 1_000_000n)
+  const { withdrawal } = await requestWithdrawal(ltc.withdrawals, {
+    userId: USER,
+    assetCode: 'LTC',
+    destination: LTC_DESTINATION,
+    amount: 100_000n,
+    clientKey: 'ltc-1',
+    correlationId: 'req-ltc',
+    actor: `user:${USER}`,
+  })
+
+  assert.equal(withdrawal.chain, 'ltc')
+  assert.equal(withdrawal.assetCode, 'LTC')
+  assert.equal(withdrawal.destination, LTC_DESTINATION)
+
+  // The row is really in the table, which is the only proof migration 10 widened the constraint:
+  // before it, this insert failed with `withdrawals_chain_ck`.
+  const rows = await sql<{ chain: string }[]>`select chain from withdrawals where id = ${withdrawal.id}`
+  assert.equal(rows[0]?.chain, 'ltc')
+})
+
+test('LITECOIN: a Bitcoin address is refused as a Litecoin destination', { skip }, async () => {
+  // The defect that loses coins, refused at the point a user could still fix it — before the
+  // balance is reserved and before anything is queued.
+  const ltc = harness(sql, { fees: { LTC: 200n } })
+  await assert.rejects(
+    () =>
+      requestWithdrawal(ltc.withdrawals, {
+        userId: USER,
+        assetCode: 'LTC',
+        destination: BTC_DESTINATION,
+        amount: 100_000n,
+        clientKey: 'ltc-2',
+        correlationId: 'req-ltc',
+        actor: `user:${USER}`,
+      }),
+    AddressError,
+  )
+  // Nothing was written, so the refusal is genuinely before the row rather than a rollback.
+  const rows = await sql<{ id: string }[]>`select id from withdrawals`
+  assert.equal(rows.length, 0)
+})
+
+test('LITECOIN: a deposit address can be assigned, which is the other half of the gap', { skip }, async () => {
+  // `assignDepositAddress` refused LTC with 400 `not_depositable` for exactly the same reason the
+  // withdrawal refused it with 422: `chainForAsset('LTC')` was null.
+  const ltc = harness(sql)
+  const assignment = await assignDepositAddress(ltc.deposits, {
+    userId: USER,
+    assetCode: 'LTC',
+    correlationId: 'req-ltc',
+  })
+  assert.equal(assignment.chain, 'ltc')
+  assert.equal(assignment.assetCode, 'LTC')
 })

@@ -25,7 +25,7 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 import type { Network } from '@cloudsforge/contracts-chain'
-import type { ChainId } from './addresses.ts'
+import { custodyChainOf, type ChainId } from './addresses.ts'
 import type { LiveScope } from '@cloudsforge/contracts-auth'
 
 /**
@@ -271,7 +271,13 @@ export function httpCustodyClient(options: CustodyClientOptions): CustodyClient 
           method: 'POST',
           body: {
             userId: request.userId,
-            chain: request.chain,
+            // **CUSTODY'S CHAIN NAME, NOT THIS SERVICE'S SLUG.** `custody/src/server.ts:691`
+            // refuses anything outside its own `CHAIN_ASSET` keys with 400 `unknown_chain`, and
+            // those keys are `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember`. This
+            // service sent the slug, so every deposit for ETH, BTC and SOL was refused. See
+            // `custodyChainOf`. The translation is HERE, at the wire, so nothing on this side of
+            // the boundary — rows, events, URNs — changes vocabulary.
+            chain: custodyChainOf(request.chain),
             network: request.network,
             purpose: request.purpose,
             orderId: request.orderId,
@@ -310,9 +316,15 @@ function parseAddress(body: CustodyKeyReply, request: CreateAddressRequest): Cus
   if (typeof address !== 'string' || address.trim().length === 0) {
     throw new CustodyContractError('custody returned a key with no address on it')
   }
-  if (key.chain !== request.chain) {
+  // **CUSTODY ECHOES ITS OWN CHAIN NAME, SO THE COMPARISON IS AGAINST THE TRANSLATED VALUE.**
+  // Comparing custody's `ethereum` against this service's `eth` would reject every correct reply
+  // as a contract violation — which is the mirror of the defect on the request side, and it is
+  // load-bearing that both halves move together: fixing only the request turns a 400 from custody
+  // into a `CustodyContractError` here, which is the same outage wearing a different name.
+  const expectedChain = custodyChainOf(request.chain)
+  if (key.chain !== expectedChain) {
     throw new CustodyContractError(
-      `custody minted a ${String(key.chain)} address for a ${request.chain} request`,
+      `custody minted a ${String(key.chain)} address for a ${expectedChain} request`,
     )
   }
   if (key.network !== request.network) {

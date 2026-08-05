@@ -62,6 +62,7 @@ import {
   httpCustodyClient,
   type CustodyClient,
 } from './custodyclient.ts'
+import { CHAIN_IDS, custodyChainOf, type ChainId } from './addresses.ts'
 import { assignDepositAddress } from './deposits.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import {
@@ -271,6 +272,60 @@ async function withCustody(
 }
 
 /* ------------------------------------------------------------------ the client alone */
+
+test('THE CHAIN ON THE WIRE IS CUSTODY NAME, NOT THIS SERVICE SLUG', async () => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * A THIRD DEFECT IN THIS SEAM, FOUND THE SAME WAY THE FIRST TWO WERE, AND LIVE FOR THREE ASSETS
+   * BEFORE LITECOIN EXISTED.
+   *
+   * Custody's `CHAIN_ASSET` is keyed by chain NAME — `ethereum`, `bitcoin`, `litecoin`, `solana`,
+   * `xrp`, `ember` — and `custody/src/server.ts:691` refuses anything outside those keys with 400
+   * `unknown_chain`. This service's `ChainId` is the asset code lowercased. They agree on two of
+   * six and disagree on four, and this client sent the slug verbatim. So `POST /v1/deposits` for
+   * ETH, BTC and SOL was answering 400 from custody — the FUNDING PATH, for three assets that
+   * shipped.
+   *
+   * **The reason no test saw it is the reason this case exists: the test above pins `ember`, and
+   * `ember` is one of the two slugs that happens to equal its own chain name.** A contract test
+   * that exercises one value proves the contract for one value. Every disagreeing chain is
+   * asserted below, so adding a seventh chain without a translation entry fails here.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  const expected: ReadonlyArray<readonly [ChainId, string]> = [
+    ['ember', 'ember'],
+    ['xrp', 'xrp'],
+    ['eth', 'ethereum'],
+    ['btc', 'bitcoin'],
+    ['sol', 'solana'],
+    ['ltc', 'litecoin'],
+  ]
+  await withCustody(async (custody) => {
+    for (const [slug, name] of expected) {
+      await custody.client.createAddress({
+        userId: USER,
+        chain: slug,
+        network: 'testnet',
+        purpose: 'deposit',
+        orderId: `order-${slug}`,
+        idempotencyKey: `wallet:deposit:${slug}`,
+      })
+    }
+    expected.forEach(([slug, name], i) => {
+      assert.equal(
+        custody.seen[i]?.body['chain'],
+        name,
+        `${slug} must reach custody as '${name}' — it refuses its own unknown chains with 400`,
+      )
+    })
+    // Stated as a set too: every chain this service knows must have a translation, so a new
+    // ChainId with no entry sends `undefined` and is caught here rather than in production.
+    assert.equal(expected.length, CHAIN_IDS.length, 'every ChainId must be covered by this case')
+    for (const chain of CHAIN_IDS) {
+      assert.equal(typeof custodyChainOf(chain), 'string', `${chain} has no custody chain name`)
+    }
+  })
+})
 
 test('the request custody is sent carries every field custody requires', async () => {
   await withCustody(async (custody) => {
