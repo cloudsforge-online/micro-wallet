@@ -151,8 +151,34 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
    */
   runner.register(WATCH_KIND, async (_job, ctx) => {
     const pending = await unwatchedAssignments(deps.sql, BATCH)
+    let skipped = 0
     for (const assignment of pending) {
       if (ctx.signal.aborted) return
+      /*
+       * ══════════════════════════════════════════════════════════════════════════════════════════
+       * **AN ADDRESS ON A CHAIN NOBODY FOLLOWS IS NOT A REGISTRATION THIS JOB CAN REPAIR**, and
+       * retrying it took the whole indexer client down with it.
+       *
+       * Measured: the estate held eleven assignments on chains the indexer follows no source for,
+       * and `POST /v1/watch/ltc/...` answers **500** — `watched_addresses_chain_ck` in the indexer
+       * does not admit every chain custody derives for. Every thirty seconds this job replayed all
+       * of them, and `HttpClient` opens a circuit breaker per CLIENT rather than per route. So the
+       * one indexer client wallet holds was permanently open, and the observability gate on the
+       * deposit path — which asks that same client whether a chain is watched — could not ask, fell
+       * back on its "we could not confirm" refusal, and **refused EMBER deposits too**.
+       *
+       * A registration that cannot succeed is skipped rather than retried. The row keeps
+       * `watched_at` null, stays in `unwatchedAssignments`, stays on the metric, and starts being
+       * repaired the moment an operator gives the indexer a provider for that chain — which is the
+       * same event that reopens deposits for it. Nothing is lost and nothing is hidden; what stops
+       * is one unfixable call per address per tick against a shared circuit.
+       * ══════════════════════════════════════════════════════════════════════════════════════════
+       */
+      const observed = await deps.deposits.observability.observe(assignment.chain, assignment.network)
+      if (!observed.observable) {
+        skipped += 1
+        continue
+      }
       try {
         await watchAssignment(deps.deposits, assignment)
         deps.logger.info('deposit address registered with the indexer', {
@@ -171,6 +197,16 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       await ctx.heartbeat()
     }
     deps.metrics.set('wallet_deposit_addresses_unwatched', pending.length)
+    // Reported separately from the total, because the two need different actions: a backlog this
+    // job is working through is a wait, and one it is skipping is an owner deciding whether to
+    // support the chain at all.
+    deps.metrics.set('wallet_deposit_addresses_unobservable', skipped)
+    if (skipped > 0) {
+      deps.logger.warn('deposit addresses on chains this estate cannot observe were not registered', {
+        skipped,
+        hint: 'they will register themselves once the indexer follows the chain; see micro-org#183',
+      })
+    }
   })
 
   /**

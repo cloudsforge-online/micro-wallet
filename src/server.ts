@@ -184,6 +184,14 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       labels: [],
     })
     .register({
+      name: 'wallet_deposit_addresses_unobservable',
+      help:
+        'Of the unwatched, how many are on a chain the indexer follows no source for. Not a fault ' +
+        'and not zero-by-default: it is the owner deciding whether to support the chain.',
+      kind: 'gauge',
+      labels: [],
+    })
+    .register({
       name: 'wallet_withdrawals_total',
       help: 'Withdrawal requests, by outcome',
       kind: 'counter',

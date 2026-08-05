@@ -256,8 +256,15 @@ test('THE RULE: an unrelayable row is quarantined, so it cannot starve the money
     values (${WITHDRAWAL_REQUESTED}, 'http://settlement.test/events')
   `
   // Written FIRST, so it sorts ahead of the withdrawal and occupies the window.
+  //
+  // A topic no registry knows, stated as a literal. This used to be `DEPOSIT_ADDRESS_ASSIGNED`,
+  // which was the estate's actual poison row — and it is not one any more, because
+  // `@cloudsforge/contracts-events` now registers all five of the wallet topics it was missing
+  // (micro-org#179). Naming a real topic here would make this test pass or fail on the REGISTRY's
+  // contents rather than on the relay's behaviour, and the behaviour is what it exists to hold: a
+  // row the contract refuses must leave the window rather than sit at the head of it for ever.
   await withOutbox(db(), 'wallet', async (_tx, emit) => {
-    emit({ topic: DEPOSIT_ADDRESS_ASSIGNED, key: 'w-1', payload: { address: 'addr-1' } })
+    emit({ topic: 'wallet.nothing.registered', key: 'w-1', payload: { address: 'addr-1' } })
   })
   await withOutbox(db(), 'wallet', async (_tx, emit) => {
     emit({ topic: WITHDRAWAL_REQUESTED, key: 'w-1', payload: { withdrawalId: 'w-1' } })
@@ -277,7 +284,7 @@ test('THE RULE: an unrelayable row is quarantined, so it cannot starve the money
     select topic, quarantine_reason from outbox where quarantined_at is not null
   `
   assert.equal(quarantined.length, 1)
-  assert.equal(quarantined[0]?.topic, DEPOSIT_ADDRESS_ASSIGNED)
+  assert.equal(quarantined[0]?.topic, 'wallet.nothing.registered')
   // The reason is kept so the backlog says WHY, and so the dead-letter drain can tell a row that
   // needs a registry entry from one that needs a producer fix.
   assert.match(String(quarantined[0]?.quarantine_reason), /registry/)
