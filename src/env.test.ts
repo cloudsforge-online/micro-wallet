@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -13,7 +14,12 @@ const BASE: Record<string, string> = {
   WALLET_DATABASE_URL: 'postgres://wallet:wallet@127.0.0.1:5432/wallet',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-  OUTBOX_SIGNING_SECRET: 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4',
+  // GENERATED, not written. The literal that used to sit here was
+  // `K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4` — 32 characters, and therefore past the old 24-character
+  // floor, but only 24 BYTES of key material once base64-decoded. It is one of the values pinned
+  // in `@cloudsforge/secrets`' own test as a real defect this estate shipped. Every test in this
+  // file was built on it, so the whole suite was asserting that a sub-floor key is acceptable.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
   LEDGER_URL: 'http://127.0.0.1:4004',
   CUSTODY_URL: 'http://127.0.0.1:4005',
   INDEXER_URL: 'http://127.0.0.1:4006',
@@ -28,14 +34,32 @@ for (const [key, value] of Object.entries(BASE)) process.env[key] = value
  * `WALLET_SERVICE_TOKEN` is not there either: it was removed, and the tests below assert that its
  * absence is fine and its presence is reported rather than silently obeyed.
  */
+/**
+ * THIS FIXTURE CONTAINS HYPHENS ON PURPOSE, AND THAT IS THE MOST IMPORTANT THING ABOUT IT.
+ *
+ * A credential body is base64**url**, so `-` and `_` are in its alphabet. Measured on the running
+ * estates: the mainnet credential is alphanumeric and the testnet one CONTAINS A HYPHEN. So a
+ * "secrets have no hyphens" rule — which is correct for the signing key, and which every
+ * placeholder this estate wrote would have failed — passes mainnet and kills testnet at boot.
+ *
+ * Keeping a hyphenated credential here means that mistake fails CI instead of failing one estate
+ * in production. Do not "tidy" the hyphens out of this value.
+ */
 const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
 
 /**
- * Two obviously-fake secrets, long enough to pass the 24-character rule. They stand for "the new
- * one" and "the one being rotated out" in the acceptance-list cases below.
+ * "The new one" and "the one being rotated out" for the acceptance-list cases below.
+ *
+ * These were `fake-new-outbox-secret-0000000000` and `fake-old-outbox-secret-1111111111`, whose
+ * own comment said they were "long enough to pass the 24-character rule". That is the defect
+ * stated out loud: both are hyphenated, zero-padded placeholders of exactly the family that
+ * reached 44 containers as micro-org #142, and this suite asserted they were VALID secrets.
+ *
+ * Generated rather than replaced with better-looking literals, so a placeholder cannot creep back
+ * in the next time somebody needs a fixture.
  */
-const NEW_SECRET = 'fake-new-outbox-secret-0000000000'
-const OLD_SECRET = 'fake-old-outbox-secret-1111111111'
+const NEW_SECRET = randomBytes(48).toString('base64')
+const OLD_SECRET = randomBytes(48).toString('base64')
 
 const { EnvError, SERVICE, env: eager, loadEnv, parseFeeQuotes, parseSecretList } =
   await import('./env.ts')
@@ -122,10 +146,21 @@ test('a known placeholder secret is refused outright', () => {
   }
 })
 
-test('a short secret is refused, so a memorable password fails too', () => {
+test('a short secret is refused, and the unit is BYTES rather than keystrokes', () => {
+  // This assertion used to demand the message say "at least 24" — the keystroke floor that let
+  // micro-org #142's 40-character placeholder through every service in the estate. Pinning that
+  // wording made the test a defence of the defective rule: any fix that stopped counting
+  // characters would fail CI, however much better the new rule was.
+  //
+  // What it asserts now is the PROPERTY that matters. `hunter2` happens to be spelled in the
+  // base64 alphabet, so it is not the alphabet that catches it — it decodes to 5 bytes.
   assert.throws(
     () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'hunter2' }),
-    (err: unknown) => err instanceof EnvError && /at least 24/.test((err as Error).message),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /5 bytes of key material/.test(err.message) &&
+      /at least 32/.test(err.message) &&
+      !err.message.includes('hunter2'),
   )
 })
 
@@ -157,9 +192,14 @@ test('every entry in OUTBOX_ACCEPT_SECRETS is validated exactly like the signing
     () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET},changeme` }),
     (err: unknown) => err instanceof EnvError && /placeholder/.test((err as Error).message),
   )
+  // Same fix as above, and the index matters: the message must name WHICH entry failed, because an
+  // operator with the file open counts commas — and must not carry the entry itself.
   assert.throws(
     () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${NEW_SECRET},hunter2` }),
-    (err: unknown) => err instanceof EnvError && /at least 24/.test((err as Error).message),
+    (err: unknown) =>
+      err instanceof EnvError &&
+      /OUTBOX_ACCEPT_SECRETS\[1\]/.test(err.message) &&
+      /at least 32/.test(err.message),
   )
   // A duplicate makes "which key verified this" ambiguous, and that answer is how an operator
   // knows a rotation has finished.

@@ -35,6 +35,9 @@ importers:
       '@cloudsforge/lifecycle':
         specifier: link:../runtime/packages/lifecycle
         version: link:../runtime/packages/lifecycle
+      '@cloudsforge/secrets':
+        specifier: link:../runtime/packages/secrets
+        version: link:../runtime/packages/secrets
       '@cloudsforge/telemetry':
         specifier: link:../runtime/packages/telemetry
         version: link:../runtime/packages/telemetry

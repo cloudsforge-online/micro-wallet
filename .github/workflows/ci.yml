@@ -44,19 +44,33 @@ jobs:
       postgres-version: '17'
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs the variables it declares, not just a database, or it exits
-      # before it can serve /livez. CI-only NON-secrets: the two secrets only have to clear a length
-      # check, the upstream URLs are never dialled because /livez needs no upstream, and the
-      # challenge domain and URI are the SIWE binding — ci.test here, never a real origin, because a
-      # challenge bound to a real domain is a challenge that could be replayed against it.
+      # before it can serve /livez. The upstream URLs are never dialled because /livez needs no
+      # upstream, and the challenge domain and URI are the SIWE binding — ci.test here, never a real
+      # origin, because a challenge bound to a real domain could be replayed against it.
+      #
+      # `OUTBOX_SIGNING_SECRET=@generate` REPLACED `ci-only-not-a-real-secret-000000000000`, and the
+      # comment that used to sit here said the secrets "only have to clear a length check". That was
+      # the defect stated out loud in configuration: this service now runs @cloudsforge/secrets at
+      # boot, which refuses a value that is not shaped like a generated secret, and the CI literal
+      # is refused by the same rule that refuses the estate placeholder of micro-org #142.
+      #
+      # The answer is not a CI exemption — there is none, deliberately, because an escape hatch is
+      # reached for in exactly the hurry that produced the defect. `@generate` is expanded by
+      # service-ci.yml into a fresh `openssl rand -base64 48` per run and thrown away. CI does not
+      # need a WEAK secret, it needs A secret: nothing in the smoke test verifies a signature
+      # against anything else.
+      #
+      # `WALLET_SERVICE_TOKEN` is GONE rather than generated. It is the retired 600-second token,
+      # this service only reports whether it is present, and setting it in CI made the smoke test
+      # exercise a state no correct deployment should be in.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         LEDGER_URL=http://127.0.0.1:4004
         CUSTODY_URL=http://127.0.0.1:4005
         INDEXER_URL=http://127.0.0.1:4006
         PRICING_URL=http://127.0.0.1:4007
-        WALLET_SERVICE_TOKEN=ci-only-not-a-real-token-0000000000000
         WALLET_CHALLENGE_DOMAIN=ci.test
         WALLET_CHALLENGE_URI=http://ci.test/verify
     secrets:

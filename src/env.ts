@@ -32,6 +32,12 @@ import {
   type AssetCode,
   type Network,
 } from '@cloudsforge/contracts-chain'
+import {
+  SecretError,
+  assertGeneratedSecret,
+  assertServiceCredential,
+  parseSecretList as parseSharedSecretList,
+} from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -49,20 +55,19 @@ export class EnvError extends Error {
 }
 
 /**
- * Values that must never be accepted. The list is short on purpose: it holds the strings that
- * actually appear in this repository's own `.env.example` and compose files, because those are
- * the ones that get copied into a deployment by someone in a hurry.
+ * THE `PLACEHOLDERS` SET THAT USED TO BE HERE IS GONE, AND ITS ABSENCE IS THE FIX.
+ *
+ * It held eight exact strings and was paired with a 24-character floor. Neither could fail for the
+ * value that actually reached 44 containers on both networks: micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` is 40 characters and was on nobody's list. A check
+ * that cannot fail is worse than no check, because the absence of an alarm gets read as the
+ * absence of a problem — and this service moves money.
+ *
+ * A deny-list of exact strings is structurally unable to work: the next placeholder somebody
+ * writes is, by definition, not on it. `@cloudsforge/secrets` asserts the SHAPE of a generated
+ * value instead, which is the property a placeholder cannot have. It is imported rather than
+ * copied so that this service cannot drift from the other sixteen.
  */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -72,16 +77,36 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and
+ * the command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * The estate's shared event-bus HMAC key — one key behind every service-to-service POST, including
+ * the ones that credit a deposit.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. The old `minLength` parameter is gone rather
+ * than kept in front: it is a strict subset of the shape check, and running it first answers a
+ * 40-character placeholder with "must be at least 24 characters" — true, useless, and about the
+ * wrong property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertGeneratedSecret(name, value))
   return value
 }
 
@@ -91,22 +116,32 @@ function optional(source: Source, name: string, fallback: string): string {
 }
 
 /**
- * A secret that may be absent, but must be real if present.
+ * A SERVICE CREDENTIAL that may be absent, but must be real if present.
  *
- * The distinction matters for the identity credential: absent is a deployment that has not been
- * given one yet and is reported by `/readyz`; a 20-character placeholder is a deployment that
- * believes it HAS one, and would fail on its first call to a peer with a 401 that reads as
- * "identity rejected wallet" rather than "nobody set this variable".
+ * ── ABSENCE IS A SUPPORTED MODE, AND IT STAYS ONE ──────────────────────────────────────────────
+ *
+ * Absent is a deployment that has not been granted a credential yet; it returns `null`, `/readyz`
+ * reports it, and the service runs. Turning that into `exit(1)` would convert a gap into an
+ * outage on the service that holds user balances. The empty check therefore stays AHEAD of the
+ * assertion, because compose interpolates `${WALLET_IDENTITY_CREDENTIAL:-}` and an unset
+ * credential arrives as the empty string — that is the supported mode, not a malformed one.
+ *
+ * What is not supported is a value that is present and rubbish: a 20-character placeholder is a
+ * deployment that believes it HAS a credential, and it fails on its first call to a peer with a
+ * 401 that reads as "identity rejected wallet" rather than "nobody set this variable".
+ *
+ * ── WHY NOT `assertGeneratedSecret` ────────────────────────────────────────────────────────────
+ *
+ * Because it would refuse every credential this estate has ever minted, and wallet would exit 1 at
+ * boot on BOTH networks. A credential is `cfsc_` + base64url, which is neither wholly base64 nor
+ * wholly hex — the underscore in its own prefix disqualifies it. Measured live, the testnet
+ * credential also CONTAINS A HYPHEN while the mainnet one does not, so the "no hyphens" instinct
+ * that is correct for the signing key above would have booted mainnet and killed testnet.
  */
-function optionalSecret(source: Source, name: string, minLength = 24): string | null {
+function optionalCredential(source: Source, name: string): string | null {
   const value = source[name]?.trim()
   if (!value) return null
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertServiceCredential(name, value))
   return value
 }
 
@@ -129,25 +164,15 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
  * `devplatform`'s `parseSecretList` and `activity`'s `ACTIVITY_INGEST_SECRETS`.
  */
 export function parseSecretList(raw: string, name: string): readonly string[] {
-  const entries = raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-  if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
-  for (const entry of entries) {
-    if (PLACEHOLDERS.has(entry.toLowerCase())) {
-      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
-    }
-    if (entry.length < 24) {
-      throw new EnvError(`${name} entries must each be at least 24 characters`)
-    }
-  }
-  if (new Set(entries).size !== entries.length) {
-    // A duplicated secret in the list makes the "which key verified this" answer ambiguous, and
-    // that answer is what tells an operator whether a rotation has finished.
-    throw new EnvError(`${name} lists the same secret twice`)
-  }
-  return Object.freeze(entries)
+  // Argument order is flipped on the way through: this service's exported signature is
+  // `(raw, name)` and the shared one is `(name, raw)`. Kept rather than changed because the
+  // signature is part of this module's public surface, and a silent flip of two `string`
+  // parameters is a change the type checker cannot catch.
+  //
+  // EVERY ENTRY FACES THE FULL RULE, INCLUDING THE OUTGOING ONE. In a rotation overlap window the
+  // outgoing key is the one an attacker already holds if it leaked, and "just for the drain" is
+  // exactly how a placeholder survives the rotation that was meant to remove it.
+  return asEnvError(() => parseSharedSecretList(name, raw))
 }
 
 function boolean(source: Source, name: string, fallback: boolean): boolean {
@@ -440,7 +465,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   // Read before the literal below, because the accept list defaults to it. Note the order: the
   // signing secret is validated first, so a deployment with a bad one is told about THAT rather
   // than about a list it never set.
-  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET')
+  const outboxSigningSecret = requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET')
 
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
@@ -468,7 +493,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     identityUrl: optional(source, 'IDENTITY_URL', required(source, 'IDENTITY_ISSUER')),
     // Not `requiredSecret`: see the field comment. The absence is caught by `/readyz`, which is a
     // check that can fail, rather than by a boot that CI cannot perform.
-    identityCredential: optionalSecret(source, 'WALLET_IDENTITY_CREDENTIAL'),
+    identityCredential: optionalCredential(source, 'WALLET_IDENTITY_CREDENTIAL'),
     legacyServiceTokenPresent: (source['WALLET_SERVICE_TOKEN']?.trim() ?? '').length > 0,
     upstreamDeadlineMs: integer(source, 'WALLET_UPSTREAM_DEADLINE_MS', 8_000, 250, 60_000),
     challengeTtlSeconds: integer(source, 'WALLET_CHALLENGE_TTL_SECONDS', 600, 30, 3_600),
