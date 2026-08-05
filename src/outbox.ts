@@ -290,6 +290,7 @@ export function createRelay(deps: RelayDeps): Handler {
       select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
         from outbox
        where published_at is null
+         and quarantined_at is null
        order by occurred_at
        limit ${batchSize}
     `
@@ -308,10 +309,25 @@ export function createRelay(deps: RelayDeps): Handler {
         // and `market`, `trade`, `community` and `devplatform` all shipped exactly that for weeks
         // without noticing, because their suites verified against their own fake buses.
         //
-        // Logged and SKIPPED, not published: the row stays unpublished so the defect is visible in
-        // the backlog and is delivered once whatever produced it is fixed, rather than being
-        // silently marked done.
-        deps.logger.error('outbox row is not a valid envelope; not relayed', {
+        // QUARANTINED, not merely skipped. Skipping left the row at the head of the relay's
+        // `order by occurred_at limit N` window, so it was re-read and re-logged every tick — and
+        // once N such rows accumulated the window held nothing else and the relay could no longer
+        // deliver ANY event. On mainnet that had already happened: 50 unregistered-topic rows were
+        // starving 194 `wallet.wallet.created` and, more to the point, a `wallet.withdrawal.
+        // requested` — the one topic with a live subscriber. A poison row is not a transient
+        // failure and must not be able to hold the money path behind it.
+        //
+        // Still unpublished, still visible, still replayable: see migration 11. Clearing
+        // `quarantined_at` returns the row to the window, which is what the dead-letter drain does
+        // once the producer or the registry is fixed.
+        await deps.sql`
+          update outbox
+             set quarantined_at = now(), quarantine_reason = ${built.defects.join('; ')}
+           where id = ${event.id}
+        `
+        // One line per row rather than one per row per tick: the row leaves the window here, so
+        // this cannot repeat for it. That is the whole of the 13,650-errors-in-five-minutes flood.
+        deps.logger.error('outbox row is not a valid envelope; quarantined, not relayed', {
           eventId: event.id,
           topic: event.topic,
           defects: built.defects,

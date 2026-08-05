@@ -241,6 +241,59 @@ test('THE RULE: a subscriber added later still receives an earlier event', { ski
   assert.equal(after.calls[0]?.path, '/events')
 })
 
+test('THE RULE: an unrelayable row is quarantined, so it cannot starve the money path', { skip }, async () => {
+  // The defect this asserts against took mainnet's wallet relay down completely. An envelope the
+  // contract rejects used to be skipped without being marked, so it stayed at the head of the
+  // relay's `order by occurred_at limit N` window and was re-read every tick. Once N such rows
+  // accumulated the window held nothing else, and no event of ANY topic could be relayed again:
+  // 440 rows were backed up behind 50 unregistered-topic ones, including the single
+  // `wallet.withdrawal.requested` — the only topic with a live subscriber.
+  //
+  // `batchSize: 1` is the whole estate's condition in miniature: one poison row is enough to fill
+  // the window. Before the fix the assertion at the bottom fails for ever, however many passes run.
+  await sql`
+    insert into event_subscriptions (topic, url)
+    values (${WITHDRAWAL_REQUESTED}, 'http://settlement.test/events')
+  `
+  // Written FIRST, so it sorts ahead of the withdrawal and occupies the window.
+  await withOutbox(db(), 'wallet', async (_tx, emit) => {
+    emit({ topic: DEPOSIT_ADDRESS_ASSIGNED, key: 'w-1', payload: { address: 'addr-1' } })
+  })
+  await withOutbox(db(), 'wallet', async (_tx, emit) => {
+    emit({ topic: WITHDRAWAL_REQUESTED, key: 'w-1', payload: { withdrawalId: 'w-1' } })
+  })
+
+  const { clientFor, calls } = stubClient()
+  const relay = createRelay({
+    sql: db(),
+    logger: quietLogger(),
+    signingSecret: SECRET,
+    clientFor,
+    batchSize: 1,
+  })
+
+  await relay(relayJob, relayCtx)
+  const quarantined = await sql<{ topic: string; quarantine_reason: string | null }[]>`
+    select topic, quarantine_reason from outbox where quarantined_at is not null
+  `
+  assert.equal(quarantined.length, 1)
+  assert.equal(quarantined[0]?.topic, DEPOSIT_ADDRESS_ASSIGNED)
+  // The reason is kept so the backlog says WHY, and so the dead-letter drain can tell a row that
+  // needs a registry entry from one that needs a producer fix.
+  assert.match(String(quarantined[0]?.quarantine_reason), /registry/)
+  // Not published. The fact never reached anyone, and recording otherwise would make the backlog
+  // lie about what the estate has seen.
+  const stillUnpublished = await sql<{ n: number }[]>`
+    select count(*)::int as n from outbox where quarantined_at is not null and published_at is null
+  `
+  assert.equal(stillUnpublished[0]?.n, 1)
+
+  // THE POINT: the window has moved past it, so the withdrawal behind it is delivered.
+  await relay(relayJob, relayCtx)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]?.path, '/events')
+})
+
 test('the relay signs the exact bytes and keys the POST idempotently', { skip }, async () => {
   await sql`
     insert into event_subscriptions (topic, url) values (${DEPOSIT_CREDITED}, 'http://activity.test/events')

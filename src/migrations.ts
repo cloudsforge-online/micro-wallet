@@ -488,6 +488,53 @@ export const MIGRATIONS: readonly Migration[] = [
       alter table platform_addresses add constraint platform_addresses_chain_ck ${CHAIN_CK_V10};
     `,
   },
+  {
+    version: 11,
+    name: 'outbox_quarantine',
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * A POISON ROW MUST NOT BE ABLE TO STOP THE MONEY PATH.
+     *
+     * The relay reads `where published_at is null order by occurred_at limit 50`, and a row whose
+     * envelope the contract rejects was skipped without being marked — so it stayed at the head of
+     * that window for ever. Once the number of unrelayable rows reached the batch size, the window
+     * contained nothing else and NO further event could be relayed, whatever its topic.
+     *
+     * That is not hypothetical. On mainnet it had already happened: 440 unpublished rows, of which
+     * the oldest 50 were all `wallet.deposit_address.assigned` — a topic no registry carries — and
+     * behind them sat 194 `wallet.wallet.created`, a `wallet.deposit.confirmed`, a
+     * `wallet.link.verified` and a `wallet.withdrawal.requested`. That last one is the money path:
+     * it is the only topic with a live subscriber, and it was never going to be delivered. The
+     * relay re-read the same 50 rows every tick and logged 13,650 errors in five minutes doing it.
+     *
+     * So the skip becomes a QUARANTINE: the row is set aside, the relay's window moves past it,
+     * and everything behind it drains.
+     *
+     * Set aside, NOT discarded, and not marked published. `published_at` stays null because the
+     * fact was never published, and saying otherwise would make the backlog lie about what the
+     * estate has seen. `quarantined_at` records that the relay has stopped offering it and
+     * `quarantine_reason` records why, so the row is still a visible defect and still replayable:
+     * clearing the column returns it to the window, which is what `runbook-dead-letter-drain.md`
+     * drains once the producer or the registry is fixed.
+     *
+     * Validation is deterministic — the same row against the same build fails the same way — so
+     * there is no attempt counter here. Retrying an unregistered topic cannot succeed until code
+     * changes, and when code changes the drain is the deliberate step that reconsiders it.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table outbox add column if not exists quarantined_at    timestamptz;
+      alter table outbox add column if not exists quarantine_reason text;
+
+      -- The relay's access path, narrowed to what the relay can actually offer. Quarantined rows
+      -- leave the index for the same reason published ones do: they are no longer candidates, and
+      -- an index the size of the backlog is the point of the partial.
+      drop index if exists outbox_unpublished_idx;
+      create index if not exists outbox_relayable_idx
+        on outbox (occurred_at)
+        where published_at is null and quarantined_at is null;
+    `,
+  },
 ]
 
 /**
