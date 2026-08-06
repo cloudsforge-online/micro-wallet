@@ -1,12 +1,14 @@
 {
   "name": "@cloudsforge/wallet",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "The user-facing money API. Wallet registry, external wallet links and verification, deposit address assignment, withdrawal requests, conversions, transfers and the portfolio read. Owns no balances and no keys.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node --import tsx src/index.ts",
     "migrate": "node --import tsx src/migrator.ts",

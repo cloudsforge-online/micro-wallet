@@ -46,6 +46,7 @@ import {
   txUrn,
 } from '@cloudsforge/contracts-chain'
 import type { Actor } from '@cloudsforge/contracts-money'
+import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import { canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts'
 import { uuidv7 } from './ids.ts'
 import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
@@ -395,6 +396,57 @@ async function watch(deps: DepositDeps, assignment: AssignmentRecord): Promise<v
     // Deliberately silent here; `jobs.ts` logs and retries. A log line per failed registration on
     // a busy provisioning path would drown the one that matters, which is the job giving up.
   }
+}
+
+/**
+ * Which assets this deployment will actually issue a deposit address for, right now.
+ *
+ * **This exists because the UI had no way to ask, and guessed.** `hub-web`'s Receive built its
+ * list from the user's HOLDINGS, which is circular: you could only receive an asset you already
+ * held, so a new asset was unreachable through the interface no matter how completely the estate
+ * supported it. A person with only EMBER was offered only EMBER, for ever.
+ *
+ * The obvious alternative — ship a static list in the bundle — was tried and correctly rejected:
+ * it would offer assets the service then refuses, and "never offer an asset the service will
+ * refuse" is the rule that keeps a wallet honest. The list has to come from whatever `assign`
+ * itself would decide, or the two drift the moment a chain is added or a provider fails.
+ *
+ * So this asks the SAME `observability.observe` that `assertObservable` asks, per chain, and
+ * reports the answer with its reason. `unavailable` is not a synonym for `unsupported`: the first
+ * may be true for ten minutes, the second until someone deploys a node, and a person deciding
+ * whether to wait deserves to know which.
+ */
+export async function depositableAssets(
+  deps: DepositDeps,
+): Promise<readonly { assetCode: string; chain: ChainId; depositable: boolean; reason: string | null }[]> {
+  const out: { assetCode: string; chain: ChainId; depositable: boolean; reason: string | null }[] = []
+  // Cached per chain: several assets can share one (an ERC-20 and ETH), and asking the indexer
+  // once per ASSET would multiply the same question by the size of the catalogue.
+  const seen = new Map<ChainId, { observable: boolean; reason: string | null }>()
+  for (const assetCode of ON_CHAIN_ASSETS) {
+    const chain = chainForAsset(assetCode)
+    if (chain === null) continue
+    let observation = seen.get(chain)
+    if (observation === undefined) {
+      try {
+        const answer = await deps.observability.observe(chain, deps.network)
+        observation = { observable: answer.observable, reason: answer.observable ? null : answer.reason }
+      } catch {
+        // An indexer that cannot be reached is `unknown`, never `unsupported`. Reporting a
+        // transient outage as "this estate does not support Litecoin" would be a lie with a long
+        // half-life — people remember being told something is unsupported.
+        observation = { observable: false, reason: 'unknown' }
+      }
+      seen.set(chain, observation)
+    }
+    out.push({
+      assetCode,
+      chain,
+      depositable: observation.observable,
+      reason: observation.reason,
+    })
+  }
+  return Object.freeze(out)
 }
 
 export async function activeAssignment(

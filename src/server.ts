@@ -62,6 +62,7 @@ import { AddressError, isChainId, type ChainId } from './addresses.ts'
 import { CustodyContractError, CustodyRefusedError, CustodyUnavailableError } from './custodyclient.ts'
 import {
   assignDepositAddress,
+  depositableAssets,
   DepositError,
   handleDepositConfirmed,
   listAssignments,
@@ -692,6 +693,20 @@ function buildRoutes(): Route[] {
       } finally {
         done()
       }
+    }),
+
+    /**
+     * What this deployment can take a deposit in, right now.
+     *
+     * Read-scope and not user-specific: the answer is a property of the estate, not of an account.
+     * It exists so a client never has to guess — Receive used to build its menu from the caller's
+     * HOLDINGS, which made a new asset unreachable, because you could only receive what you already
+     * had.
+     */
+    route('GET', '/v1/deposits/assets', async (ctx, deps) => {
+      await authenticate(ctx, deps, READ_SCOPE)
+      const assets = await depositableAssets(deps.deposits)
+      return { status: 200, body: { assets, network: deps.network } }
     }),
 
     route('GET', '/v1/deposits', async (ctx, deps) => {
