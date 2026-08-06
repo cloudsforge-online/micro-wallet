@@ -4,11 +4,11 @@
  * `@cloudsforge/auth` proves the provider in isolation. This file proves the ADOPTION, which is a
  * different claim and the one that was wrong here: wallet had the right seam and the wrong body.
  *
- *     const token = () => env.serviceToken        // src/index.ts:90, before this change
+ *     const token = () => env.serviceToken        // src/index.ts, before this change
  *
  * A function called per request, so that a short-TTL token "can be rotated without a restart when
  * identity starts minting them" — returning a string read once at boot from a token that dies in
- * 600 seconds (identity/src/tokens.ts:28). Every peer call in this service began failing ten
+ * 600 seconds (identity/src/tokens.ts). Every peer call in this service began failing ten
  * minutes into every deployment.
  *
  * WHY THIS SUITE COULD NOT SEE IT, AND WHY THIS FILE IS SHAPED AS IT IS. Every other test here
@@ -35,7 +35,7 @@ const IDENTITY = 'http://identity:4000'
 const LEDGER = 'http://ledger:4000'
 const CREDENTIAL = 'cfsc_TToR-eOeVTDnqhX1-nu6-u7DoCr4MCfa86g4g6kd404'
 
-/** identity/src/tokens.ts:28. Unchanged by this fix, and it must stay unchanged. */
+/** identity/src/tokens.ts. Unchanged by this fix, and it must stay unchanged. */
 const SERVICE_TTL_SECONDS = 600
 
 const T0 = Date.UTC(2026, 7, 3, 12, 0, 0)

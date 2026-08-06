@@ -7,7 +7,7 @@
  * is wiring no test can reach. `index.ts` opens a pool, asserts a schema and calls `listen()`;
  * importing it from a test starts a server. So the line that was wrong —
  *
- *     const token = () => env.serviceToken        // index.ts:90, for months
+ *     const token = () => env.serviceToken        // index.ts, for months
  *
  * — was structurally untestable, and a suite full of tests that build their own clients could not
  * have caught it however carefully they were written. A test that constructs its own provider
@@ -18,7 +18,7 @@
  *
  * The seam was right and the body was wrong. `token` is a function called per request precisely so
  * a short-TTL token could rotate without a restart — but it returned a string read once at boot,
- * from a token that expires in 600 seconds (identity/src/tokens.ts:28), and nothing re-minted it
+ * from a token that expires in 600 seconds (identity/src/tokens.ts), and nothing re-minted it
  * because minting required the `admin` role. Ten minutes into every deployment, all four peers
  * below began refusing every call.
  *

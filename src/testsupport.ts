@@ -371,11 +371,11 @@ export interface FakeCustody extends CustodyClient {
  * It is here so a test about assignment, rotation and watching does not need a key store. It is
  * NOT evidence about the custody seam, and for the whole of its life it read as though it were:
  * it returned a `custodyKeyUrn` that custody has never published, and it accepted a request with
- * no `orderId`, which custody refuses 400 (`custody/src/server.ts:349`). Every deposit test in
+ * no `orderId`, which custody refuses 400 (`custody/src/server.ts`). Every deposit test in
  * this suite passed against it while the live funding path was dead.
  *
  * Two things changed so that it cannot do that again. It now **refuses a request custody would
- * refuse**, by the same rule (`stringField`, `custody/src/server.ts:852`), so a caller that stops
+ * refuse**, by the same rule (`stringField`, `custody/src/server.ts`), so a caller that stops
  * sending the binding fails here too. And the URN it returns is minted by the SAME function the
  * real client uses, so the two cannot disagree about the form. The shape of the wire itself is
  * `custodycontract.test.ts`'s job, over a real socket, against a stub that speaks custody's
@@ -383,7 +383,7 @@ export interface FakeCustody extends CustodyClient {
  *
  * The idempotency-key dedupe below is kept because callers rely on it, but note that CUSTODY DOES
  * NOT DO THIS: it has no idempotency handling at all and `provisionAddress` mints unconditionally
- * (`custody/src/keys.ts:101`). Do not read a passing retry test here as evidence about the estate.
+ * (`custody/src/keys.ts`). Do not read a passing retry test here as evidence about the estate.
  */
 /**
  * Addresses the fake custody mints, per chain.

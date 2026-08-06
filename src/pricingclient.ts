@@ -24,8 +24,8 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
 /**
  * The scopes this service's token must carry to call pricing.
  *
- * `pricing:read` is registered and pricing enforces it (`pricing/src/server.ts:78,492`) — but the
- * one route this client calls, `GET /rates` (`pricing/src/server.ts:312`), is not gated at all:
+ * `pricing:read` is registered and pricing enforces it (`pricing/src/server.ts,492`) — but the
+ * one route this client calls, `GET /rates` (`pricing/src/server.ts`), is not gated at all:
  * the board is public. So this grant is currently WIDER than the call sites need, and it is kept
  * deliberately rather than emptied, for a reason that belongs to the derivation and not to this
  * service: `derive-grants.mjs` treats a module that presents a credential and declares NO scope

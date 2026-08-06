@@ -33,7 +33,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * The scopes this service's token must carry to call the indexer.
  *
  * Both, and both are used. `PUT /v1/watch/:chain/:network/:address` registers a deposit address
- * to watch and goes through `authorise(…, WRITE_SCOPE)` (`indexer/src/server.ts:90,551`);
+ * to watch and goes through `authorise(…, WRITE_SCOPE)` (`indexer/src/server.ts,551`);
  * `GET /v1/addresses/…/activity` goes through `authoriseRead`, which demands
  * `READ_SCOPE = 'indexer:read'` (`:89,727`).
  *

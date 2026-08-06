@@ -50,16 +50,16 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  *
  * `httpFeeQuoter` below builds a token-bearing `HttpClient` and calls
  * `GET /v1/fees/:chain/:network/:assetCode`, which authenticates and then demands
- * `READ_SCOPE = 'settlement:read'` of a service principal (`settlement/src/server.ts:103,455-468`).
+ * `READ_SCOPE = 'settlement:read'` of a service principal (`settlement/src/server.ts,455-468`).
  * That scope was in no constant here, so the deploy could not derive it and the hand-written
  * compose map never carried it. A misspelled scope kills identity at boot; a MISSING one is
  * quieter — the token mints, the service starts, and one route 403s.
  *
  * **The 403 is latent rather than live, and the distinction is worth stating precisely.**
- * `index.ts:189` wires `staticFeeQuoter(env.feeQuotes)`, not `httpFeeQuoter`, and nothing else in
+ * `index.ts` wires `staticFeeQuoter(env.feeQuotes)`, not `httpFeeQuoter`, and nothing else in
  * the repository constructs one — so no withdrawal fee quote has ever been served over HTTP and
  * none has ever been refused. It would have been refused on the first request after the one-line
- * swap `index.ts:185-186` describes, which is exactly the moment nobody would be looking for an
+ * swap `index.ts` describes, which is exactly the moment nobody would be looking for an
  * authorisation failure. Declaring it now means the grant arrives with the swap instead of after
  * the incident.
  *

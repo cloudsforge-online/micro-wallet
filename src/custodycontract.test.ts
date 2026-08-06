@@ -8,10 +8,10 @@
  *
  * It was broken in BOTH directions at once, and nothing in the estate said so:
  *
- *   1. **This service did not send `orderId`.** `custody/src/server.ts:349` reads it with
+ *   1. **This service did not send `orderId`.** `custody/src/server.ts` reads it with
  *      `stringField(body, 'orderId')` — no default, unlike the `enumField(..., fallback)` calls
  *      for `network`, `purpose` and `scheme` on the three lines below it — so it is required, and
- *      `stringField` (`custody/src/server.ts:852`) throws `BadRequestError` when it is absent.
+ *      `stringField` (`custody/src/server.ts`) throws `BadRequestError` when it is absent.
  *      `httpCustodyClient` sent `userId`, `chain`, `network` and `purpose` and nothing else, so
  *      every live call answered 400. Measured through the gateway on 2026-08-04:
  *
@@ -19,14 +19,14 @@
  *          → 400 {"error":{"code":"bad_request","message":"orderId must be a non-empty string"}}
  *
  *   2. **Custody does not return `custodyKeyUrn`, and never did.** Its success body is
- *      `{ key: <CustodyKeyRecord> }` (`custody/src/server.ts:368`), and `CustodyKeyRecord`
- *      (`custody/src/store.ts:62-74`, built by `toKeyRecord` at `custody/src/store.ts:83`) carries
+ *      `{ key: <CustodyKeyRecord> }` (`custody/src/server.ts`), and `CustodyKeyRecord`
+ *      (`custody/src/store.ts`, built by `toKeyRecord` at `custody/src/store.ts`) carries
  *      `address, chain, family, purpose, network, scheme, derivationPath, status, keyVersion,
  *      createdAt, exportedAt` — no URN, and no id of any kind, because `custody_keys` is keyed by
- *      `address` (`custody/src/migrations.ts:98`). This file's client declared the response as a
+ *      `address` (`custody/src/migrations.ts`). This file's client declared the response as a
  *      flat `CustodyAddress` with a `custodyKeyUrn`, so had half 1 been fixed alone, `minted.address`
  *      would have been `undefined` and `canonicaliseAddress` would have thrown on
- *      `undefined.trim()` (`addresses.ts:126`) — a 500 in place of a 400.
+ *      `undefined.trim()` (`addresses.ts`) — a 500 in place of a 400.
  *
  * ── WHY THIS FILE STANDS UP A SERVER RATHER THAN A FAKE `CustodyClient` ──────────────────────
  *
@@ -159,9 +159,9 @@ async function custodyLike(
         body,
       })
 
-      // `stringField` — required, non-empty, ≤512 chars (`custody/src/server.ts:852-858`). The
+      // `stringField` — required, non-empty, ≤512 chars (`custody/src/server.ts`). The
       // three fields custody reads this way for this route are `chain`, `userId` and `orderId`
-      // (`custody/src/server.ts:347-349`). `network`, `purpose` and `scheme` are `enumField` with
+      // (`custody/src/server.ts`). `network`, `purpose` and `scheme` are `enumField` with
       // a fallback on the three lines below, which is exactly why they were never missed.
       for (const name of ['chain', 'userId', 'orderId']) {
         const value = body[name]
@@ -193,7 +193,7 @@ async function custodyLike(
        * IDEMPOTENCY, AS CUSTODY IMPLEMENTS IT SINCE ITS MIGRATION 6.
        *
        * `idempotency-key` is a HEADER, set by `@cloudsforge/http` from `request.idempotencyKey` and
-       * read by custody at `custody/src/server.ts:367`. Same key and same binding is a replay: 200,
+       * read by custody at `custody/src/server.ts`. Same key and same binding is a replay: 200,
        * `reused: true`, and the ORIGINAL address. Same key and a DIFFERENT `orderId` is a 409, not
        * an address — custody refuses rather than hand back a key bound to another order, because
        * settlement restates `orderId` to sweep and a mismatch is a sweep refused for ever.
@@ -213,8 +213,8 @@ async function custodyLike(
       }
 
       counter += 1
-      // `toKeyRecord` (`custody/src/store.ts:83-96`) — every field it publishes, and nothing else.
-      // No URN, no id: `custody_keys` is keyed by `address` (`custody/src/migrations.ts:98`).
+      // `toKeyRecord` (`custody/src/store.ts`) — every field it publishes, and nothing else.
+      // No URN, no id: `custody_keys` is keyed by `address` (`custody/src/migrations.ts`).
       const address = `0x${counter.toString(16).padStart(40, 'b')}`
       mintedAddresses.push(address)
       const key: Record<string, unknown> = {
@@ -233,7 +233,7 @@ async function custodyLike(
       if (idemKey !== undefined) {
         byIdempotencyKey.set(idemKey, { address, orderId: String(body['orderId']), key })
       }
-      // `{ status: 201, body: { key } }` — `custody/src/server.ts:381`. The envelope matters as
+      // `{ status: 201, body: { key } }` — `custody/src/server.ts`. The envelope matters as
       // much as the fields: a client that reads the top level finds nothing it wants.
       const reply = options.override ? options.override(body) : { key }
       res.writeHead(201, { 'content-type': 'application/json' })
@@ -280,7 +280,7 @@ test('THE CHAIN ON THE WIRE IS CUSTODY NAME, NOT THIS SERVICE SLUG', async () =>
    * BEFORE LITECOIN EXISTED.
    *
    * Custody's `CHAIN_ASSET` is keyed by chain NAME — `ethereum`, `bitcoin`, `litecoin`, `solana`,
-   * `xrp`, `ember` — and `custody/src/server.ts:691` refuses anything outside those keys with 400
+   * `xrp`, `ember` — and `custody/src/server.ts` refuses anything outside those keys with 400
    * `unknown_chain`. This service's `ChainId` is the asset code lowercased. They agree on two of
    * six and disagree on four, and this client sent the slug verbatim. So `POST /v1/deposits` for
    * ETH, BTC and SOL was answering 400 from custody — the FUNDING PATH, for three assets that
@@ -587,9 +587,9 @@ test(
 
         // THE URN NAMES CUSTODY'S SPELLING, THE ROW STORES THIS SERVICE'S. Custody minted a
         // lower-case address here; `deposits.ts` re-canonicalises to EIP-55 before writing the row
-        // (`deposits.ts:206`) because `address_key` has to match what a deposit event is looked up
+        // (`deposits.ts`) because `address_key` has to match what a deposit event is looked up
         // by. The URN must NOT follow it: `custody_keys` is keyed by the exact string custody
-        // stored (`custody/src/migrations.ts:98`), so a URN carrying the checksummed form would
+        // stored (`custody/src/migrations.ts`), so a URN carrying the checksummed form would
         // name a key custody cannot find. The two differing is the assertion.
         assert.equal(
           assignment.custodyKeyUrn,
@@ -602,9 +602,9 @@ test(
         )
 
         // THE BINDING. custody stores whatever `orderId` minted the address and compares it
-        // character for character at signing time (SD-09, 12-security-decisions.md:398;
-        // custody/src/gates.ts:182). settlement has to restate it to sweep the deposit, and its
-        // only route to it is this row — `settlement/src/server.ts:739` says so in as many words.
+        // character for character at signing time (SD-09, 12-security-decisions.md;
+        // custody/src/gates.ts). settlement has to restate it to sweep the deposit, and its
+        // only route to it is this row — `settlement/src/server.ts` says so in as many words.
         // So the value sent MUST be one this service can still produce later, and the assignment
         // id is that value.
         const sent = custody.seen.at(-1)

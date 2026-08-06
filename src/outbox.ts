@@ -70,7 +70,7 @@ export const DEPOSIT_ADDRESS_ASSIGNED = 'wallet.deposit_address.assigned'
  *
  * The constant keeps its name because "credited" is what this service does and what the row is
  * called (`deposit_credits`); the WIRE name is the registry's, and the registry's keying is what
- * this emit already used — `keyedBy: 'wallet_id'`, deposits.ts:658.
+ * this emit already used — `keyedBy: 'wallet_id'`, deposits.ts.
  */
 export const DEPOSIT_CREDITED = 'wallet.deposit.confirmed'
 export const WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
@@ -100,7 +100,7 @@ export interface DomainEvent {
  * "major.minor" STRING — and `validateEnvelope` refuses an envelope without one, reporting
  * "version: missing". This service typed it `number` end to end and sent `1`, so every event it
  * has ever relayed was rejected at the envelope by every consumer, however correct the signature
- * was. identity hit the same thing and fixed it the same way (identity/src/outbox.ts:78).
+ * was. identity hit the same thing and fixed it the same way (identity/src/outbox.ts).
  *
  * The stored column stays an integer — storage records the major — and the mapping to the
  * contract's shape happens here, at the wire, in one place.

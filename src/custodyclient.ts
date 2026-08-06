@@ -36,7 +36,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  *
  * `@cloudsforge/contracts-auth` registers `custody:address:create`, and custody gates the only
  * route this file calls on exactly that: `ADDRESS_CREATE_SCOPE = 'custody:address:create'`
- * (`custody/src/server.ts:104`). Both sides were re-read before this line was edited; the
+ * (`custody/src/server.ts`). Both sides were re-read before this line was edited; the
  * registry is the correct side.
  *
  * It never caused an outage, which is the interesting part. The hand-written compose map happened
@@ -63,7 +63,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  *
  * `LiveScope = Exclude<Scope, DeprecatedScope>`, and `DeprecatedScope` is computed FROM `SCOPES`
  * by a conditional type over the `deprecated` field rather than hand-listed, so it cannot drift
- * from the registry (`contracts/packages/auth/src/index.ts:507`). `Scope` keeps its wide meaning
+ * from the registry (`contracts/packages/auth/src/index.ts`). `Scope` keeps its wide meaning
  * on purpose: reading a token is wide, because one may arrive carrying a scope that has since
  * died; demanding is narrow. This is the demanding direction.
  */
@@ -109,7 +109,7 @@ export class CustodyRefusedError extends Error {
  * ── THIS IS THE CLASS OF DEFECT THAT MADE THIS FILE WRONG FOR ITS WHOLE LIFE ─────────────────
  *
  * `CustodyAddress` used to be handed straight out of `client.request<CustodyAddress>()`, which is
- * a cast and not a check. Custody replies `{ key: {…} }` (`custody/src/server.ts:368`) and has
+ * a cast and not a check. Custody replies `{ key: {…} }` (`custody/src/server.ts`) and has
  * never published a `custodyKeyUrn`, so every field this service wanted was `undefined` — and
  * `undefined` does not announce itself. It travels: into `canonicaliseAddress(chain, undefined)`
  * as a `TypeError` on `.trim()`, or into `custody_key_urn text not null` as a constraint
@@ -136,18 +136,18 @@ const SCHEMES: ReadonlySet<string> = new Set<KeyScheme>(['flat_random', 'hd_bip4
  * ── CUSTODY HAS NO URN, AND IT IS RIGHT NOT TO ───────────────────────────────────────────────
  *
  * The docstring above this used to promise `cf:custody:key:<id>`, and custody has no id: its key
- * table is keyed by `address` (`custody/src/migrations.ts:98`), `04-domain-model.md` §3.3 lists no
+ * table is keyed by `address` (`custody/src/migrations.ts`), `04-domain-model.md` §3.3 lists no
  * identifier field at all, and every route that names one key names it by address —
  * `GET /v1/addresses/:address`, and the `/v1/sign` binding whose five fields include `address`
- * (`12-security-decisions.md:398`). Asking custody to invent an identifier so that this column
+ * (`12-security-decisions.md`). Asking custody to invent an identifier so that this column
  * could be filled would be adding an identity to the service that holds keys, in order to satisfy
  * a naming choice made in the service that does not.
  *
- * So the URN is minted here. `04-domain-model.md:20` sets the form as `cf:<service>:<type>:<id>`
+ * So the URN is minted here. `04-domain-model.md` sets the form as `cf:<service>:<type>:<id>`
  * and allows "chain addresses" as the id where "an external system dictates otherwise" — but an
  * address alone is not unique across networks. That is not hypothetical for this estate: the XRP
  * testnet/mainnet address collision is a recorded defect (`04-domain-model.md` §4.1) and it is
- * why `hd_bip44` puts the network in the coin type (`custody/src/keys.ts:112-121`). `chain` and
+ * why `hd_bip44` puts the network in the coin type (`custody/src/keys.ts`). `chain` and
  * `network` are therefore qualifiers, exactly as `cf:chain:<chain>:<network>:<hash>` already does
  * for transactions elsewhere in the estate.
  *
@@ -183,23 +183,23 @@ export interface CreateAddressRequest {
   readonly purpose: 'deposit'
   /**
    * **The signing binding, and the reason this key exists.** Required by custody
-   * (`custody/src/server.ts:349` — `stringField`, no default, unlike the three `enumField` calls
-   * below it), stored `not null` (`custody/src/migrations.ts:105`), and compared character for
-   * character before any signature is produced (`custody/src/gates.ts:182`, SD-09 at
-   * `12-security-decisions.md:398`). It was not sent at all until 2026-08-04, so every deposit
+   * (`custody/src/server.ts` — `stringField`, no default, unlike the three `enumField` calls
+   * below it), stored `not null` (`custody/src/migrations.ts`), and compared character for
+   * character before any signature is produced (`custody/src/gates.ts`, SD-09 at
+   * `12-security-decisions.md`). It was not sent at all until 2026-08-04, so every deposit
    * provisioning call this service ever made was refused 400.
    *
    * **It is the deposit assignment's id**, which is not an arbitrary choice. settlement has to
    * restate this exact string to sweep the address, has nothing to derive it from, and says so:
    * "`userId` and `orderId` are whatever wallet used when it had custody mint the address … A
-   * guessed binding is a sweep refused every tick for ever" (`settlement/src/server.ts:739`). The
+   * guessed binding is a sweep refused every tick for ever" (`settlement/src/server.ts`). The
    * assignment id is the one value this service can still produce for that address years later —
    * it is the row's primary key — so it needs no column of its own to stay restatable. It is also
    * one binding per address rather than one per user-and-asset, which matters because the
-   * binding's entropy is entirely in `userId` and `orderId` (`custody/src/keys.ts:291`) and a
+   * binding's entropy is entirely in `userId` and `orderId` (`custody/src/keys.ts`) and a
    * rotation that reused the previous string would spend that entropy twice.
    *
-   * mint made the same choice for the same reason: `orderId: token.id` (`mint/src/deploy.ts:179`).
+   * mint made the same choice for the same reason: `orderId: token.id` (`mint/src/deploy.ts`).
    */
   readonly orderId: string
   /**
@@ -211,7 +211,7 @@ export interface CreateAddressRequest {
    * true when written and is not now. Both are re-checked against custody's source rather than
    * against this comment's history:
    *
-   *   * the header is read at `custody/src/server.ts:367` and carried into `provisionAddress`;
+   *   * the header is read at `custody/src/server.ts` and carried into `provisionAddress`;
    *   * a repeat under one key returns the ORIGINAL address with 200 and `reused: true`
    *     (`custody/src/keys.ts` `findReplay`);
    *   * and the invariant is a unique index, `custody_keys_idempotency_uniq` on
@@ -231,7 +231,7 @@ export interface CreateAddressRequest {
  * Custody's success body: `{ key: <CustodyKeyRecord> }`.
  *
  * Declared separately from `CustodyAddress` because they are not the same shape and pretending
- * they were is the whole defect. `CustodyKeyRecord` is `custody/src/store.ts:62-74`.
+ * they were is the whole defect. `CustodyKeyRecord` is `custody/src/store.ts`.
  */
 interface CustodyKeyReply {
   readonly key?: {
@@ -271,7 +271,7 @@ export function httpCustodyClient(options: CustodyClientOptions): CustodyClient 
           method: 'POST',
           body: {
             userId: request.userId,
-            // **CUSTODY'S CHAIN NAME, NOT THIS SERVICE'S SLUG.** `custody/src/server.ts:691`
+            // **CUSTODY'S CHAIN NAME, NOT THIS SERVICE'S SLUG.** `custody/src/server.ts`
             // refuses anything outside its own `CHAIN_ASSET` keys with 400 `unknown_chain`, and
             // those keys are `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember`. This
             // service sent the slug, so every deposit for ETH, BTC and SOL was refused. See

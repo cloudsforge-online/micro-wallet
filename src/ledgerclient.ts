@@ -40,7 +40,7 @@ import type { LiveScope } from '@cloudsforge/contracts-auth'
  * All three are used, one per family of call site: `POST /entries` is gated on
  * `POST_SCOPE = 'ledger:post'`, `POST /reservations` and `POST /reservations/:id/release` on
  * `RESERVE_SCOPE = 'ledger:reserve'`, and `GET /accounts/:subject/balances` on
- * `READ_SCOPE = 'ledger:read'` (`ledger/src/server.ts:78-80, 346, 431, 470, 499`).
+ * `READ_SCOPE = 'ledger:read'` (`ledger/src/server.ts, 346, 431, 470, 499`).
  *
  * `readonly LiveScope[]` rather than `readonly string[]`: see the header of `custodyclient.ts`.
  */

@@ -13,7 +13,7 @@
  *   * `CUSTODY_SCOPES` had said `custody:address` — a scope that has never existed — for the life
  *     of the service. The consequence is not a 403 on one route: identity validates its grants
  *     against the registry at import and refuses to start on an unknown name
- *     (`identity/src/env.ts:141`), so an unregistered demand here is a dead identity container and
+ *     (`identity/src/env.ts`), so an unregistered demand here is a dead identity container and
  *     therefore no tokens for anybody.
  *   * `settlement.ts` had declared NOTHING while building a token-bearing client, so
  *     `settlement:read` could not be derived at all. A missing scope is the quiet one — the token

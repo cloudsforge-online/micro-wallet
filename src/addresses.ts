@@ -129,7 +129,7 @@ export function chainForAsset(assetCode: string): ChainId | null {
  * Found while adding Litecoin, and it is **not a Litecoin defect**: it has been live for ETH, BTC
  * and SOL since deposit provisioning was built. Custody's `CHAIN_ASSET` is keyed by chain NAME —
  * `ethereum`, `bitcoin`, `litecoin`, `solana`, `xrp`, `ember` — because those are the values the
- * rows it adopted from forge-keyvault already carry, and `custody/src/server.ts:691` refuses
+ * rows it adopted from forge-keyvault already carry, and `custody/src/server.ts` refuses
  * anything else with 400 `unknown_chain`. This service's slug is the asset code lowercased.
  *
  * The two agree on exactly two of six, `ember` and `xrp`, and disagree on the other four. So

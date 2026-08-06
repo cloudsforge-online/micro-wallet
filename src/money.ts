@@ -116,7 +116,7 @@ export interface SpendInput {
    * What the user is paying WITH.
    *
    * **`IssuableAssetCode`, so a retired asset is a COMPILE error rather than a 400.** That type is
-   * `Exclude<AssetCode, 'SHARD'>` (`contracts/packages/chain/src/index.ts:68`), and typing this
+   * `Exclude<AssetCode, 'SHARD'>` (`contracts/packages/chain/src/index.ts`), and typing this
    * field with it is the whole of the fix — `micro-mint` took the same shape and it is why a retired
    * code can no longer reach a posting from there either. The alternative, validating at runtime,
    * would have left the next caller free to make the same mistake and find out from the ledger.

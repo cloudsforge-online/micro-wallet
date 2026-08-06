@@ -1,7 +1,7 @@
 /**
  * Run a money-moving operation at most once per key.
  *
- * **The shape is taken from `repos/forge-pay/services/pay/src/store.ts:153`.** That function is
+ * **The shape is taken from `repos/forge-pay/services/pay/src/store.ts`.** That function is
  * the best code in the existing estate and this service inherits its behaviour rather than
  * inventing a second one. What it gets right, and what is preserved here in full:
  *

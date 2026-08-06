@@ -407,7 +407,7 @@ async function handle(
       // `assignDepositAddress` looks for an active assignment first, so the second attempt only
       // reaches custody if the first left no row — NOT because the idempotency key dedupes, which
       // this comment used to claim. Custody has no idempotency handling at all
-      // (`custody/src/keys.ts:101` mints unconditionally); the header is sent so that it works the
+      // (`custody/src/keys.ts` mints unconditionally); the header is sent so that it works the
       // day custody honours it, and until then the row check is the whole guarantee.
       ctx.log.error('custody unavailable', { err })
       return errorReply(503, 'custody_unavailable', 'address issuance is temporarily unavailable', ctx.requestId)
