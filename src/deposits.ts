@@ -231,7 +231,10 @@ export async function assignDepositAddress(
       // whether this address will ever produce a deposit event, and a stale null there is a
       // dashboard reporting a problem that has just been fixed.
       if (existing.watchedAt === null) {
-        await watch(deps, existing)
+        // NOT freshly derived. This row already existed when the request arrived, which means the
+        // user was handed this address on an earlier call — see `watchAssignment` for why a claim
+        // about an address already in circulation is the dangerous one.
+        await watch(deps, existing, false)
         return (await findAssignment(deps.sql, existing.id)) ?? existing
       }
       return existing
@@ -369,7 +372,13 @@ export async function assignDepositAddress(
     return toAssignment(row)
   })
 
-  await watch(deps, assignment)
+  // `freshlyDerived: true`, and this is the only call site that passes it. It runs in the same
+  // request that minted the key, seconds after custody derived it and before the address has been
+  // returned to anyone — so "nothing can have paid it before now" is a statement of fact rather
+  // than an assumption. It is what lets the indexer derive a UTXO balance for this address on a
+  // chain it did not walk from genesis; `indexerclient.watch` carries what the claim costs if it
+  // is ever untrue.
+  await watch(deps, assignment, true)
   return (await findAssignment(deps.sql, assignment.id)) ?? assignment
 }
 
@@ -381,13 +390,18 @@ export async function assignDepositAddress(
  * and re-requesting would find the row and return it *still unwatched*. Recording `watched_at`
  * only on success is what makes the job's "everything with a null" query correct.
  */
-async function watch(deps: DepositDeps, assignment: AssignmentRecord): Promise<void> {
+async function watch(
+  deps: DepositDeps,
+  assignment: AssignmentRecord,
+  freshlyDerived: boolean,
+): Promise<void> {
   try {
     await deps.indexer.watch(
       assignment.chain,
       assignment.network,
       assignment.address,
       `deposit:${assignment.userId}`,
+      freshlyDerived,
     )
     await deps.sql`
       update deposit_address_assignments set watched_at = now() where id = ${assignment.id}
@@ -498,7 +512,17 @@ export async function unwatchedAssignments(
   return rows.map(toAssignment)
 }
 
-/** Exported for the job, which repairs registrations without going through the request path. */
+/**
+ * Exported for the job, which repairs registrations without going through the request path.
+ *
+ * **No `freshlyDerived` here, deliberately.** This runs some unknown time after the address was
+ * minted, and the user already has it — the request path returns the assignment whether or not the
+ * registration succeeded. So "nothing can have paid it before now" is exactly the claim that may
+ * have stopped being true, and on a UTXO chain a false claim of that shape lets the indexer derive
+ * a total with a real deposit missing from it: an understatement, which is positive drift at the
+ * ledger and freezes the asset. Saying nothing instead makes the indexer refuse with
+ * `history_unknown` on a cold-started chain, which is loud, and correct.
+ */
 export async function watchAssignment(
   deps: DepositDeps,
   assignment: AssignmentRecord,

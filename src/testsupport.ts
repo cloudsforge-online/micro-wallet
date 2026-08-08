@@ -460,7 +460,13 @@ export function fakeCustody(): FakeCustody {
 /* ------------------------------------------------------------------ indexer */
 
 export interface FakeIndexer extends IndexerClient {
-  readonly watched: ReadonlyArray<{ chain: ChainId; network: Network; address: string }>
+  readonly watched: ReadonlyArray<{
+    chain: ChainId
+    network: Network
+    address: string
+    /** The history claim the caller made, if it made one. See `indexerclient.watch`. */
+    freshlyDerived: boolean
+  }>
   setActivity(address: string, items: readonly ObservedActivity[]): void
   failNext(err: Error): void
   /**
@@ -474,7 +480,12 @@ export interface FakeIndexer extends IndexerClient {
 }
 
 export function fakeIndexer(): FakeIndexer {
-  const watched: Array<{ chain: ChainId; network: Network; address: string }> = []
+  const watched: Array<{
+    chain: ChainId
+    network: Network
+    address: string
+    freshlyDerived: boolean
+  }> = []
   const activity = new Map<string, readonly ObservedActivity[]>()
   const providers = new Map<string, number>()
   let pendingFailure: Error | null = null
@@ -511,13 +522,13 @@ export function fakeIndexer(): FakeIndexer {
     failNext(err) {
       pendingFailure = err
     },
-    async watch(chain, network, address) {
+    async watch(chain, network, address, _label, freshlyDerived = false) {
       if (pendingFailure) {
         const err = pendingFailure
         pendingFailure = null
         throw err
       }
-      watched.push({ chain, network, address })
+      watched.push({ chain, network, address, freshlyDerived })
     },
     async activity(_chain, _network, address, limit): Promise<ActivityPage> {
       const items = activity.get(address.toLowerCase()) ?? []
