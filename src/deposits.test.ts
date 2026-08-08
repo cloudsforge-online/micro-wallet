@@ -89,6 +89,10 @@ test('an assignment mints one address, registers it, and is idempotent', { skip 
   assert.equal(h.indexer.watched.length, 1)
   assert.equal(h.indexer.watched[0]?.address, first.address)
   assert.notEqual(first.watchedAt, null)
+  // Registered WITH the claim: this call minted the key, so "nothing can have paid it before now"
+  // is a fact here. It is what makes the address's balance derivable on a UTXO chain the indexer
+  // did not walk from genesis. micro-org#252.
+  assert.equal(h.indexer.watched[0]?.freshlyDerived, true)
 
   // A managed wallet was created for it, and it carries the custody key.
   const wallets = await sql<{ origin: string; custody_key_urn: string | null }[]>`
@@ -215,6 +219,16 @@ test('an unwatched assignment is found by the retry job and repaired on the next
   })
   assert.notEqual(reread.watchedAt, null)
   assert.equal((await unwatchedAssignments(sql as never, 10)).length, 0)
+
+  // AND THE REPAIR MAKES NO CLAIM ABOUT THE ADDRESS'S PAST.
+  //
+  // `freshlyDerived` says "nothing can have paid this before now", which the mint path can state
+  // as a fact and this path cannot: the address was handed to the user on `req-1`, whether or not
+  // the registration succeeded. On a UTXO chain the indexer uses that claim to decide its own
+  // walked record reaches far enough back to derive a balance — so a false one lets it answer with
+  // a real deposit missing, which is positive drift at the ledger and a freeze on a solvent asset.
+  // The honest answer here is silence, and a `history_unknown` refusal downstream. micro-org#252.
+  assert.deepEqual(h.indexer.watched.map((w) => w.freshlyDerived), [false])
 })
 
 /* ------------------------------------------------------------------ crediting */
