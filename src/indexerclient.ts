@@ -118,7 +118,31 @@ export interface ChainStatus {
 export interface IndexerClient {
   /** Read-only, and never throws for "this chain is not followed" — that is an ANSWER. */
   chainStatus(chain: ChainId, network: Network): Promise<ChainStatus>
-  watch(chain: ChainId, network: Network, address: string, label: string | null): Promise<void>
+  /**
+   * `freshlyDerived` is a claim about the address's PAST, and only one caller can make it.
+   *
+   * On a UTXO chain the indexer cannot read a balance from the node — stock Core keeps no address
+   * index — so it derives one from the outputs it walked, and a derivation is only a balance if
+   * the walked record reaches back below anything the address could have received. The indexer
+   * cannot establish that; it has no view below its own floor. So the registrar states it, and
+   * `freshlyDerived: true` says "this key was minted moments ago, nothing can have paid it before
+   * now". The indexer stamps its own head against the address and refuses the derivation later if
+   * its record ever starts above that height. micro-org#252.
+   *
+   * **Pass it only where the key was just derived.** From the retry job it would be a claim about
+   * a moment that has passed: the address may have been handed to the user and funded already, at
+   * a height a cold-started indexer's record does not reach. That claim would let a derivation
+   * proceed while a real deposit was missing from it — an understated custody total, which is
+   * positive drift at the ledger and freezes the asset. The honest alternative there is to say
+   * nothing, and let the indexer refuse with `history_unknown` until an operator supplies a height.
+   */
+  watch(
+    chain: ChainId,
+    network: Network,
+    address: string,
+    label: string | null,
+    freshlyDerived?: boolean,
+  ): Promise<void>
   activity(
     chain: ChainId,
     network: Network,
@@ -163,13 +187,15 @@ export function httpIndexerClient(options: IndexerClientOptions): IndexerClient 
       }
     },
 
-    async watch(chain, network, address, label) {
+    async watch(chain, network, address, label, freshlyDerived = false) {
       try {
         await client.request(
           `/v1/watch/${chain}/${network}/${encodeURIComponent(address)}`,
           {
             method: 'POST',
-            body: { label },
+            // Omitted rather than sent as `false`, so an older indexer sees the body it has always
+            // seen and a newer one cannot read a `false` as a claim of anything.
+            body: freshlyDerived ? { label, freshlyDerived: true } : { label },
             // An upsert on the far side, so a retry is a no-op rather than a second row.
             idempotencyKey: `wallet:watch:${chain}:${network}:${address.toLowerCase()}`,
           },
