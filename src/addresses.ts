@@ -64,8 +64,8 @@
 
 import { createHash } from 'node:crypto'
 import {
-  type AssetCode,
   type ChainFamily,
+  type IssuableAssetCode,
   type Network,
   chainSpec,
 } from '@cloudsforge/contracts-chain'
@@ -75,23 +75,45 @@ import { keccak256 } from './keccak.ts'
  * The URL-safe slug for a chain. The asset code lowercased, which is also what the indexer's
  * `ChainId` is and what `txUrn` uses, so a path segment and a cross-service URN cannot drift.
  *
- * `shard` is deliberately absent: SHARD is in `CHAINS` only so that record is total, it never
- * exists on a chain, and a deposit address for it could only ever be a lie.
+ * **DERIVED FROM THE ASSET UNION RATHER THAN RE-TYPED, WHICH IS THE DIFFERENCE BETWEEN A NEW ASSET
+ * BEING A BUILD FAILURE AND A NEW ASSET BEING NOTHING AT ALL.**
+ *
+ * This was eight string literals until 2026-08-09. The literals were correct on the day they were
+ * last edited and correct today, and that is exactly the problem with them: nothing connected them
+ * to `AssetCode`, so the eight were right by somebody having remembered. `LTC` arrived, then `DOGE`
+ * and `ETC` in one commit (micro-contracts 63a0bc4), and each time the repair here was a person
+ * reading this file and typing. The ninth asset gets no such person.
+ *
+ * `Lowercase<IssuableAssetCode>` is the same set stated as a consequence. `AssetCode` gains a
+ * member, this type gains its slug, and `ASSET_FOR_CHAIN` below — a TOTAL
+ * `Readonly<Record<ChainId, …>>` — stops compiling until somebody says what the new chain is
+ * called. `CHAIN_IDS`, `CHAIN_FOR_ASSET` and `CUSTODY_CHAIN` all hang off that one record, so
+ * there is one place to edit and it is a place the compiler points at.
+ *
+ * `shard` is still absent, and now for a reason the type carries rather than a reason a comment
+ * asserts: `IssuableAssetCode` is `Exclude<AssetCode, 'SHARD'>`. SHARD is in `CHAINS` only so that
+ * record is total, it never exists on a chain, and a deposit address for it could only ever be a
+ * lie.
+ *
+ * ONE ASSUMPTION, WORTH STATING BECAUSE IT IS NOT PERMANENT. "Issuable" and "has a chain" are two
+ * different claims that currently coincide, because SHARD is both the only retired asset and the
+ * only chainless one. Retiring an asset that HAS on-chain history would drop its slug out of this
+ * type while its rows and its `chain` column still hold it — so on that day this derivation has to
+ * change rather than be trusted. `addresses.test.ts` pins the coincidence, so the day it stops
+ * being true is a red build rather than a surprise.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc' | 'doge' | 'etc'
+export type ChainId = Lowercase<IssuableAssetCode>
 
-export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
-  'ember',
-  'eth',
-  'btc',
-  'sol',
-  'xrp',
-  'ltc',
-  'doge',
-  'etc',
-])
-
-const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
+/**
+ * The asset a chain settles in.
+ *
+ * **The one place the correspondence is written down, and the reason it is a `Record<ChainId, …>`
+ * rather than a lookup helper: totality.** A new member of `AssetCode` becomes a new member of
+ * `ChainId` above and this object then fails to compile — `error TS2739`, naming the missing key.
+ * That is the whole mechanism, and everything below is derived from it so there is no second list
+ * to forget.
+ */
+const ASSET_FOR_CHAIN: Readonly<Record<ChainId, IssuableAssetCode>> = Object.freeze({
   ember: 'EMBER',
   eth: 'ETH',
   btc: 'BTC',
@@ -102,16 +124,16 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   etc: 'ETC',
 })
 
-const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.freeze({
-  EMBER: 'ember',
-  ETH: 'eth',
-  BTC: 'btc',
-  SOL: 'sol',
-  XRP: 'xrp',
-  LTC: 'ltc',
-  DOGE: 'doge',
-  ETC: 'etc',
-})
+/**
+ * Every chain slug, in the order `ASSET_FOR_CHAIN` declares them.
+ *
+ * Derived rather than repeated. The array this replaced held the same eight strings in the same
+ * order, and a chain added to one and not the other would have been a chain that type-checks and
+ * then fails `isChainId` at the edge of a route — a 400 on a chain the service genuinely supports.
+ */
+export const CHAIN_IDS: readonly ChainId[] = Object.freeze(
+  Object.keys(ASSET_FOR_CHAIN) as ChainId[],
+)
 
 export function isChainId(value: string): value is ChainId {
   return (CHAIN_IDS as readonly string[]).includes(value)
@@ -121,7 +143,7 @@ export function isNetwork(value: string): value is Network {
   return value === 'mainnet' || value === 'testnet'
 }
 
-export function assetOf(chain: ChainId): AssetCode {
+export function assetOf(chain: ChainId): IssuableAssetCode {
   return ASSET_FOR_CHAIN[chain]
 }
 
@@ -130,9 +152,24 @@ export function assetOf(chain: ChainId): AssetCode {
  *
  * `null` for SHARD, and that is not an oversight: Shards are a platform unit with no chain, so
  * asking for their deposit address must fail rather than fall through to a default.
+ *
+ * **THE SECOND TABLE IS GONE.** This read a `CHAIN_FOR_ASSET` typed
+ * `Readonly<Partial<Record<AssetCode, ChainId>>>` — a hand-written inversion of `ASSET_FOR_CHAIN`,
+ * with `Partial` switching off the only check that could have noticed a missing row. Two lists of
+ * the same eight pairs, kept in step by whoever last edited them, and the one with `Partial` on it
+ * was the one that failed quietly: an asset absent from it is not a type error, it is
+ * `chainForAsset` returning null, which every caller reads as "this asset has no chain" — the
+ * SHARD answer, given for an asset that has one. A deposit address request would have 400'd for a
+ * chain this service fully supports, with the error text saying the asset is off-chain.
+ *
+ * It is now a fold of the slug rule stated in `ChainId`'s comment, checked against the derived
+ * `CHAIN_IDS`, so it cannot be more or less complete than `ASSET_FOR_CHAIN` is. `'SHARD'`
+ * lower-cases to `'shard'`, which is not a `ChainId`, so the SHARD answer stays exactly as it was
+ * — by construction now rather than by omission.
  */
 export function chainForAsset(assetCode: string): ChainId | null {
-  return CHAIN_FOR_ASSET[assetCode as AssetCode] ?? null
+  const slug = assetCode.toLowerCase()
+  return isChainId(slug) ? slug : null
 }
 
 /**
