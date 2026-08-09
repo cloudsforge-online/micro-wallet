@@ -1,14 +1,130 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { CHAINS, RETIRED_ASSETS, chainSpec, type AssetCode } from '@cloudsforge/contracts-chain'
 import {
   AddressError,
+  CHAIN_IDS,
+  assetOf,
   bitcoinFamilyParams,
   canonicaliseAddress,
   chainForAsset,
+  custodyChainOf,
   decimalsOf,
   familyOf,
+  isChainId,
   isValidAddress,
+  type ChainId,
 } from './addresses.ts'
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE CHAIN VOCABULARY IS DERIVED FROM THE ASSET UNION, NOT RE-TYPED BESIDE IT
+ *
+ * Everything below is driven off `CHAINS` in contracts-chain rather than off a list written here.
+ * A test that names the eight chains is a ninth copy of the list under test, and it passes on the
+ * day a ninth asset lands for the same reason the code did: nobody edited it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/** Every asset the estate can newly issue — the set this service must have a chain slug for. */
+const ISSUABLE = Object.keys(CHAINS).filter(
+  (asset) => !RETIRED_ASSETS.includes(asset as AssetCode),
+) as readonly AssetCode[]
+
+test('every issuable asset has a chain slug, and every slug an issuable asset', () => {
+  // The bijection, asserted in both directions over the registry. `CHAIN_IDS` used to be eight
+  // string literals and `CHAIN_FOR_ASSET` a `Partial<Record<AssetCode, ChainId>>` holding the same
+  // eight pairs inverted by hand — three lists that had to be edited together, one of which had
+  // the compiler switched off. LTC, then DOGE and ETC, were each added to all three by somebody
+  // remembering to. This assertion is what remembering used to be.
+  assert.deepEqual(
+    [...CHAIN_IDS].sort(),
+    ISSUABLE.map((asset) => asset.toLowerCase()).sort(),
+    'CHAIN_IDS and the issuable assets have drifted apart',
+  )
+  for (const asset of ISSUABLE) {
+    const chain = chainForAsset(asset)
+    assert.ok(chain !== null, `${asset} is issuable and has no chain slug`)
+    assert.equal(assetOf(chain), asset, `${asset} does not round-trip through its slug`)
+  }
+})
+
+test('a retired asset has no chain slug, so its deposit address request fails rather than defaults', () => {
+  // SHARD is a platform unit with no chain; an address for it could only ever be a lie. Driven off
+  // `RETIRED_ASSETS` rather than naming SHARD, because the next retirement gets the same treatment
+  // without an edit here.
+  for (const retired of RETIRED_ASSETS) {
+    assert.equal(chainForAsset(retired), null, `${retired} is retired and must have no chain`)
+    assert.equal(isChainId(retired.toLowerCase()), false)
+  }
+})
+
+test('"issuable" and "has a chain" coincide today, and this fails on the day they stop', () => {
+  // `ChainId` is `Lowercase<IssuableAssetCode>`, which quietly assumes that the only assets without
+  // a chain are the retired ones. That is true because SHARD is both the only retired asset and the
+  // only chainless one — a coincidence, not a rule. Retiring an asset that HAS on-chain history
+  // would drop its slug out of the type while its rows and its `chain` column still carry it, and
+  // the derivation would have to change. This is that day's alarm.
+  for (const retired of RETIRED_ASSETS) {
+    const spec = chainSpec(retired)
+    assert.equal(
+      spec.confirmations,
+      0,
+      `${retired} is retired but credits at a real depth, so it has chain history that needs its slug`,
+    )
+  }
+})
+
+test('every chain slug answers for the whole vocabulary this service speaks', () => {
+  // The three derived answers, over the derived list. A chain reachable by `isChainId` that then
+  // throws inside `familyOf` or `custodyChainOf` is a 500 on a route that already said yes.
+  for (const chain of CHAIN_IDS) {
+    assert.ok(isChainId(chain))
+    assert.ok(decimalsOf(chain) > 0, `${chain} has no decimals`)
+    assert.ok(familyOf(chain).length > 0, `${chain} has no family`)
+    assert.ok(custodyChainOf(chain).length > 0, `${chain} has no custody chain name`)
+  }
+})
+
+test('EVERY BITCOIN-FAMILY CHAIN HAS ITS OWN PARAMETERS — a missing row is a chain nobody can use', () => {
+  // `BITCOIN_FAMILY_PARAMS` is keyed by `string` and `bitcoinFamilyParams` throws for an absent
+  // chain, which is the right behaviour and is deliberately not a default (see the header). But
+  // "throws" is only safe, not correct: a fourth bitcoin-family chain added to `AssetCode` compiles
+  // everywhere, passes `isChainId`, and then refuses every address a user submits with an error
+  // about parameters. Fail-closed, and completely unusable. That gap is now a test failure at the
+  // point the chain is added rather than a support ticket after it.
+  const bitcoinChains = CHAIN_IDS.filter((chain) => familyOf(chain) === 'bitcoin')
+  assert.ok(bitcoinChains.length >= 3, 'btc, ltc and doge are all bitcoin-family')
+  for (const chain of bitcoinChains) {
+    const params = bitcoinFamilyParams(chain)
+    // `hrps` may legitimately be empty — Dogecoin declares no bech32 HRP on any network — so the
+    // check is on the version bytes, which every base58 chain in the family must have.
+    assert.ok(params.versions.length > 0, `${chain} is bitcoin-family with no base58 version bytes`)
+  }
+})
+
+test('no two bitcoin-family chains share a base58 version byte or an HRP', () => {
+  // The mirror of the above, and the failure it guards is the expensive one: a shared prefix means
+  // an address valid on one chain validates as an address on another, and the coins land in an
+  // output nobody holds the key to. Asserted over the derived list so the next member is covered.
+  const seenVersions = new Map<number, ChainId>()
+  const seenHrps = new Map<string, ChainId>()
+  for (const chain of CHAIN_IDS.filter((c) => familyOf(c) === 'bitcoin')) {
+    const params = bitcoinFamilyParams(chain)
+    for (const version of params.versions) {
+      // 0x6f and 0xc4 are shared BY DESIGN — Litecoin and Dogecoin kept Bitcoin's TESTNET version
+      // bytes, which is a fact about those chains and not a defect here. Mainnet bytes are the ones
+      // that must be disjoint, and those are the low-numbered rows.
+      if (version === 0x6f || version === 0xc4) continue
+      const other = seenVersions.get(version)
+      assert.equal(other, undefined, `${chain} and ${other} share mainnet version byte ${version}`)
+      seenVersions.set(version, chain)
+    }
+    for (const hrp of params.hrps) {
+      const other = seenHrps.get(hrp)
+      assert.equal(other, undefined, `${chain} and ${other} share the bech32 HRP '${hrp}'`)
+      seenHrps.set(hrp, chain)
+    }
+  }
+})
 
 test('the display form and the comparison form are produced together', () => {
   // The defect this exists to prevent, in one assertion. forge-pay's withdrawal route compared a
