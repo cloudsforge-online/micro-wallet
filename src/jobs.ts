@@ -196,11 +196,13 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       }
       await ctx.heartbeat()
     }
-    deps.metrics.set('wallet_deposit_addresses_unwatched', pending.length)
-    // Reported separately from the total, because the two need different actions: a backlog this
-    // job is working through is a wait, and one it is skipping is an owner deciding whether to
-    // support the chain at all.
-    deps.metrics.set('wallet_deposit_addresses_unobservable', skipped)
+    // **This job no longer publishes the backlog gauges, and must not start again.** It saw one
+    // batch — `BATCH` rows, capped at 50 — so what it could report was `min(backlog, 50)` rather
+    // than the backlog, and it is LEASED, so exactly one replica ever ran it: the series existed on
+    // one scrape target and was absent on the others, which is how one fact came to have N values
+    // in the estate. `deposits.sampleDepositAddressMetrics` takes the reading at scrape time on
+    // every replica instead — see the argument on that function. `skipped` survives because the log
+    // line below is about this pass, which is exactly what a batch-scoped number can honestly say.
     if (skipped > 0) {
       deps.logger.warn('deposit addresses on chains this estate cannot observe were not registered', {
         skipped,

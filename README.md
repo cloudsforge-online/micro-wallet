@@ -111,6 +111,32 @@ Two primitives are hand-rolled, both for the reason `forge-pay/src/keccak.ts` al
 
 There is no signing in this service and there never will be.
 
+## What a scrape says about deposit addresses
+
+Four series, all labelled by `chain`, all written together at scrape time by
+`sampleDepositAddressMetrics` and meant to be read together:
+
+| Series | Means |
+| --- | --- |
+| `wallet_deposit_addresses_unwatched{chain}` | Addresses the indexer has not been asked to watch. Money sent to one produces no event. |
+| `wallet_deposit_addresses_unobservable{chain}` | The part of that backlog on a chain the indexer follows no source for. Not a fault — an owner deciding whether to support the chain. |
+| `wallet_chain_observable{chain}` | 1 if deposits on the chain are issued and credited at all. |
+| `wallet_chain_observability_unknown{chain}` | 1 if this replica has *never obtained an answer* and is refusing on that basis. |
+
+`unwatched - unobservable` per chain is the part somebody has to fix, and it is the only honest
+alerting expression over these. The last row exists because a 0 on `wallet_chain_observable` is two
+conditions with opposite repairs — "no source is followed" and "we could not ask" — and a gauge
+cannot say *unknown*; the same reason `ledger_reconciliation_observed` sits beside
+`ledger_reconciliation_drift`. Every chain gets a **measured** zero on every scrape rather than an
+absent series, because absent and healthy are the same shape to an alert, and because a labelled
+gauge cannot be removed once set.
+
+**There is no such thing as a frozen deposit address here, and no metric will ever report one.**
+`deposit_address_assignments_status_ck` admits `active`, `rotated` and `retired`. The state a
+deployed alert rule spent months looking for is defect 2 above — forge-pay's, where the address row
+carried its own high-water mark and a rotation froze crediting until somebody swept by hand. A
+rotation is a new row here, so the state cannot arise. See micro-org#310.
+
 ## What is not here
 
 * **Sending the payment.** That is `micro-settlement`, which does not exist yet.

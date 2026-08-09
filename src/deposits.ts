@@ -47,7 +47,8 @@ import {
 } from '@cloudsforge/contracts-chain'
 import type { Actor } from '@cloudsforge/contracts-money'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
-import { canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts'
+import type { Metrics } from '@cloudsforge/telemetry'
+import { CHAIN_IDS, canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts'
 import { uuidv7 } from './ids.ts'
 import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
@@ -510,6 +511,119 @@ export async function unwatchedAssignments(
      limit ${limit}
   `
   return rows.map(toAssignment)
+}
+
+/**
+ * How many deposit addresses are waiting on a registration, per chain.
+ *
+ * **A count, not the length of a page.** The gauge this feeds was previously the `.length` of
+ * `unwatchedAssignments(db, 500)`, which is `min(backlog, 500)` — a number that stops moving at
+ * the exact point the backlog becomes serious, and reports the same 500 for five hundred addresses
+ * and for fifty thousand. A gauge whose whole job is "how big is this" must not saturate.
+ *
+ * Scoped to the deployment's network. A single process settles exactly one network — `claimCredit`
+ * refuses anything else with `wrong_network`, and `assign` only ever writes `deps.network` — so a
+ * row on another network is not this deployment's backlog to repair, and counting it would page
+ * the wrong estate. The partial index `deposit_address_assignments_unwatched_idx` serves the
+ * predicate.
+ *
+ * No status filter, matching `unwatchedAssignments`: money arriving at a rotated address is still
+ * the user's, so a rotated row with a null `watched_at` is still a registration that is missing.
+ */
+export async function unwatchedByChain(
+  sql: Db,
+  network: Network,
+): Promise<ReadonlyMap<string, number>> {
+  const rows = await sql<{ chain: string; waiting: string }[]>`
+    select chain, count(*)::text as waiting
+      from deposit_address_assignments
+     where watched_at is null and network = ${network}
+     group by chain
+  `
+  return new Map(rows.map((row) => [row.chain, Number(row.waiting)]))
+}
+
+/**
+ * Publish the deposit-address backlog at scrape time.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE TWO GAUGES WERE WRITTEN FROM TWO PLACES THAT DISAGREED, AND ONE OF THEM WAS A LEASED JOB.**
+ *
+ * `wallet_deposit_addresses_unwatched` was set by the `deposit.watch` handler from
+ * `unwatchedAssignments(sql, BATCH)` — capped at 50 — and separately by `index.ts`'s `beforeScrape`
+ * from `unwatchedAssignments(db, 500)`. Same series name, two definitions of the number, alternating
+ * as the job ran. `wallet_deposit_addresses_unobservable` was set ONLY by the job, and the job is
+ * leased: exactly one replica ever claimed it, so that series existed on one scrape target and was
+ * absent on every other. Prometheus scrapes each replica separately, so the estate held N series
+ * with N different values for one fact, and `unwatched - unobservable` — the expression that
+ * separates a backlog somebody must fix from one an owner has decided not to — could not be
+ * evaluated at all on the replicas where the second series was missing.
+ *
+ * Both are now written here, from one query, on every scrape, on every replica, so the two numbers
+ * are of the same instant and their difference means something. The job no longer writes either;
+ * a batch-capped count of the page it happens to be holding is not the backlog.
+ *
+ * **Labelled by chain**, which is the dimension the condition actually has: the indexer follows one
+ * chain per estate today, so "eleven addresses unwatched" was a number an operator could do nothing
+ * with until they queried the database to find out which chain. A zero is written for every member
+ * of `CHAIN_IDS` on every scrape, so no series is ever absent (absent and healthy are the same
+ * shape to an alert) and none goes stale when a chain's backlog clears — a labelled gauge cannot be
+ * removed once set, so the zero has to be written rather than implied.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * `unobservable` is the part of the backlog on a chain this estate follows no source for. It is an
+ * owner's decision rather than a fault, and it carries the whole backlog for that chain rather
+ * than a separate count, so `unwatched - unobservable` per chain is exactly the repairable part.
+ *
+ * The observability answer is the one the DEPOSIT GATE acts on, not an independent reading of the
+ * chain: it comes from the same cached `ChainObservability` the assignment path consults, and it
+ * fails closed the same way, so an indexer this process cannot reach reports 0 here for the same
+ * reason it refuses to hand out an address. That is deliberate — the series says what this service
+ * will DO, which is the thing an operator needs — and it is why the alert built on it stays quiet
+ * during an indexer outage rather than firing on a backlog nobody could have registered anyway.
+ */
+export async function sampleDepositAddressMetrics(
+  deps: Pick<DepositDeps, 'sql' | 'network' | 'observability'>,
+  metrics: Metrics,
+): Promise<void> {
+  const backlog = await unwatchedByChain(deps.sql, deps.network)
+  // In parallel: the answers are cached for 60s, so this is at most one round trip per chain per
+  // minute per replica, and a scrape must not cost eight sequential ones.
+  const observed = await Promise.all(
+    CHAIN_IDS.map(
+      async (chain) => [chain, await deps.observability.observe(chain, deps.network)] as const,
+    ),
+  )
+  for (const [chain, observation] of observed) {
+    const waiting = backlog.get(chain) ?? 0
+    metrics.set('wallet_deposit_addresses_unwatched', waiting, { chain })
+    metrics.set(
+      'wallet_deposit_addresses_unobservable',
+      observation.observable ? 0 : waiting,
+      { chain },
+    )
+    metrics.set('wallet_chain_observable', observation.observable ? 1 : 0, { chain })
+    // **Read this before believing a 0 above.** `observable: false` is two conditions with opposite
+    // repairs — "the indexer follows no source for this chain", which is an owner's decision and
+    // the steady state for seven of these eight, and "this process has never managed to ask and has
+    // no cached answer to fall back on", which is a fault that is refusing deposits right now. A
+    // gauge cannot say "unknown", so the second one gets its own series rather than a value on the
+    // first: the same shape `ledger_reconciliation_observed` uses beside
+    // `ledger_reconciliation_drift`, and for the same reason.
+    metrics.set('wallet_chain_observability_unknown', observation.reason === 'unknown' ? 1 : 0, {
+      chain,
+    })
+  }
+  // A chain in the table that this build does not know — the `deposit_address_assignments_chain_ck`
+  // constraint makes it unreachable today, and it becomes reachable the moment a migration widens
+  // the constraint ahead of a deploy. Reported as fully repairable rather than dropped: a backlog
+  // silently missing from the total is the defect this whole change exists to remove, and an
+  // over-report is a question somebody answers where an under-report is one nobody asks.
+  for (const [chain, waiting] of backlog) {
+    if ((CHAIN_IDS as readonly string[]).includes(chain)) continue
+    metrics.set('wallet_deposit_addresses_unwatched', waiting, { chain })
+    metrics.set('wallet_deposit_addresses_unobservable', 0, { chain })
+  }
 }
 
 /**
