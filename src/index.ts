@@ -28,8 +28,7 @@ import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } fr
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
 import { indexerObservability } from './observability.ts'
-import { pendingCredits, type DepositDeps } from './deposits.ts'
-import { unwatchedAssignments } from './deposits.ts'
+import { pendingCredits, sampleDepositAddressMetrics, type DepositDeps } from './deposits.ts'
 import type { MoneyDeps } from './money.ts'
 import type { PortfolioDeps } from './portfolio.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
@@ -228,7 +227,10 @@ const server = createServer({
     // a credit claimed but never posted is money the user cannot see, and an unwatched deposit
     // address is money nobody will ever be told about.
     metrics.set('wallet_deposit_credits_pending', (await pendingCredits(db, 500)).length)
-    metrics.set('wallet_deposit_addresses_unwatched', (await unwatchedAssignments(db, 500)).length)
+    // Per chain, from one query, on every replica — and the only writer of these three series.
+    // The argument for all of that is on the function; the short version is that a leased job was
+    // publishing a batch-capped copy of one of them from one replica.
+    await sampleDepositAddressMetrics(deposits, metrics)
   },
 })
 

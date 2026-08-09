@@ -178,11 +178,21 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'gauge',
       labels: [],
     })
+    /**
+     * The three series below are one reading, taken together at scrape time by
+     * `sampleDepositAddressMetrics`. Read them together too — `unwatched - unobservable` per chain
+     * is the part of the backlog somebody has to fix, and either half alone says the wrong thing.
+     *
+     * `chain` was added in micro-org#310. The two gauges were scalars, and eleven unwatched
+     * addresses on an estate whose indexer follows one chain is a number an operator could do
+     * nothing with without opening psql. `sum(wallet_deposit_addresses_unwatched)` is the old
+     * value, exactly.
+     */
     .register({
       name: 'wallet_deposit_addresses_unwatched',
-      help: 'Deposit addresses the indexer has not been asked to watch. Should be 0.',
+      help: 'Deposit addresses on this chain the indexer has not been asked to watch. Should be 0.',
       kind: 'gauge',
-      labels: [],
+      labels: ['chain'],
     })
     .register({
       name: 'wallet_deposit_addresses_unobservable',
@@ -190,7 +200,46 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
         'Of the unwatched, how many are on a chain the indexer follows no source for. Not a fault ' +
         'and not zero-by-default: it is the owner deciding whether to support the chain.',
       kind: 'gauge',
-      labels: [],
+      labels: ['chain'],
+    })
+    /**
+     * **Whether this deployment will issue and credit a deposit address on this chain at all** —
+     * the one fact behind every refusal on the deposit path, and invisible from outside until now.
+     *
+     * `micro-indexer` follows ONE chain per estate (`INDEXER_CHAINS=ember:mainnet` on the running
+     * container), so seven of these eight read 0 on mainnet today and the estate had no series
+     * saying so. An operator asking "can we take Bitcoin deposits" had to read a container's
+     * environment. It is a gauge rather than a config assertion because the answer is MEASURED from
+     * the indexer per deployment — see `observability.ts` on why a second hardcoded list of
+     * supported chains is how the estate came to hand out a real Bitcoin address nothing watched.
+     *
+     * It reports the GATE'S DECISION, not the chain's truth: an indexer this process cannot reach
+     * and has no cached answer for reads 0, because 0 is what the deposit path will act on.
+     */
+    .register({
+      name: 'wallet_chain_observable',
+      help:
+        '1 if the indexer reports a source for this chain, so deposits on it are issued and ' +
+        'credited; 0 if not. Read it with wallet_chain_observability_unknown.',
+      kind: 'gauge',
+      labels: ['chain'],
+    })
+    /**
+     * **Read this BEFORE `wallet_chain_observable`, or read a 0 there as the wrong thing.**
+     *
+     * A zero on that gauge is either an owner's decision — the indexer follows no source for the
+     * chain, which is the steady state for seven of the eight and is not a fault — or a process
+     * that has never once obtained an answer and is refusing deposits on that basis, which is. The
+     * two need opposite responses and a single 0/1 gauge cannot tell them apart, exactly as
+     * `ledger_reconciliation_observed` exists because a drift gauge cannot say "nobody looked".
+     */
+    .register({
+      name: 'wallet_chain_observability_unknown',
+      help:
+        '1 if this replica has never obtained an observability answer for the chain and is ' +
+        'refusing deposits on it for that reason rather than because no source is followed.',
+      kind: 'gauge',
+      labels: ['chain'],
     })
     .register({
       name: 'wallet_withdrawals_total',
