@@ -348,17 +348,37 @@ export async function listWallets(sql: Db, query: ListWalletsQuery): Promise<Wal
 }
 
 /**
+ * Who moved a wallet's lifecycle, and why.
+ *
+ * Required rather than optional, so there is no transition anywhere in this service that arrives
+ * with nothing recorded about the decision behind it. Stored on the row and **not** returned in
+ * `WalletRecord`: see migration 13 — the reason is free text written for the estate, and the
+ * account holder is told the status, not the operator's sentence.
+ */
+export interface StatusChange {
+  /** `user:<id>` or `service:<name>`, the same shape the outbox and the ledger use. */
+  readonly actor: string
+  readonly reason: string
+}
+
+/**
  * Move a wallet's lifecycle state.
  *
  * The transition is checked in the row's own UPDATE — `where status = ${from}` — rather than by a
  * read followed by a write. Two operators freezing and exporting at the same moment would
  * otherwise both read `active`, both find their transition legal, and the second would overwrite
  * the first: a wallet marked `frozen` whose key has actually left.
+ *
+ * `by` is not decoration. Until micro-org#315 a status change recorded nothing but the new value,
+ * so a wallet could be frozen — or driven to the irreversible `exported` — with no actor and no
+ * reason on the row and no event anywhere. The attribution is written in the SAME statement as the
+ * status, so a row cannot exist in the new state with the old change's actor beside it.
  */
 export async function transitionWallet(
   sql: Db | Tx,
   id: string,
   to: WalletStatus,
+  by: StatusChange,
 ): Promise<WalletRecord> {
   const current = await findWallet(sql, id)
   if (!current) throw new WalletNotFoundError(id)
@@ -374,6 +394,8 @@ export async function transitionWallet(
     update wallets
        set status = ${to},
            updated_at = now(),
+           status_actor = ${by.actor},
+           status_reason = ${by.reason},
            verified_at = case when ${to} = 'active' and verified_at is null and origin <> 'watch'
                               then now() else verified_at end,
            exported_at = case when ${to} = 'exported' then now() else exported_at end,

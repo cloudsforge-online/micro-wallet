@@ -1011,3 +1011,130 @@ test('the write scope is what a wallet registration needs', { skip }, async () =
     assert.equal(res.status, 201)
   })
 })
+
+/* ------------------------------------------------------------------ the owner gate */
+
+/**
+ * A `watch` wallet is created `active` rather than `provisioning`, and `active` is the only status
+ * the PATCH route may move away from — so it is the cheapest fixture the gate below can use.
+ */
+const watchWalletFor = async (rig: Rig, writer: string, userId: string): Promise<string> => {
+  const res = await fetch(`${rig.url}/v1/wallets`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${writer}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ userId, chain: 'ember', origin: 'watch', address: evmSigner().address }),
+  })
+  assert.equal(res.status, 201)
+  return ((await res.json()) as { wallet: { id: string } }).wallet.id
+}
+
+test('THE RULE: a service principal must name the user whose wallet it is changing', { skip }, async () => {
+  // `wallet:write` is authority over the route, not over an account. A service holding it and
+  // naming nobody used to satisfy the owner gate for every wallet in the estate at once — the
+  // same shape as a missing tenant predicate, one `principal.kind === 'service'` wide.
+  const writer = await sign({ sub: 'service:hub-api', scopes: [WRITE_SCOPE] })
+  const headers = { authorization: `Bearer ${writer}`, 'content-type': 'application/json' }
+  const freeze = JSON.stringify({ status: 'frozen', reason: 'ops: chargeback under review' })
+  await withServer({}, async (rig) => {
+    const mine = await watchWalletFor(rig, writer, USER)
+
+    const unnamed = await fetch(`${rig.url}/v1/wallets/${mine}`, { method: 'PATCH', headers, body: freeze })
+    assert.equal(unnamed.status, 403)
+    assert.match(((await unnamed.json()) as { error: { message: string } }).error.message, /named user/)
+
+    const other = await fetch(`${rig.url}/v1/wallets/${mine}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ userId: testUser(2), status: 'frozen', reason: 'ops: chargeback' }),
+    })
+    assert.equal(other.status, 403)
+
+    // Neither refusal reached the row.
+    const refused = await sql<{ status: string }[]>`select status from wallets where id = ${mine}`
+    assert.equal(refused[0]?.status, 'active')
+
+    // Naming the owner is the whole of what was missing: the authority itself is unchanged.
+    const named = await fetch(`${rig.url}/v1/wallets/${mine}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ userId: USER, status: 'frozen', reason: 'ops: chargeback under review' }),
+    })
+    assert.equal(named.status, 200)
+    assert.equal(((await named.json()) as { wallet: { status: string } }).wallet.status, 'frozen')
+  })
+})
+
+test('a service reading someone else’s wallet is refused the same way', { skip }, async () => {
+  const writer = await sign({ sub: 'service:hub-api', scopes: [WRITE_SCOPE] })
+  const reader = await sign({ sub: 'service:hub-api', scopes: [READ_SCOPE] })
+  const auth = { authorization: `Bearer ${reader}` }
+  await withServer({}, async (rig) => {
+    const theirs = await watchWalletFor(rig, writer, testUser(2))
+    // The address is the user's own, and this route returns it alongside the link. A read gate that
+    // any service passes is an address-book export for the whole estate.
+    assert.equal((await fetch(`${rig.url}/v1/wallets/${theirs}`, { headers: auth })).status, 403)
+    assert.equal((await fetch(`${rig.url}/v1/wallets/${theirs}?userId=${USER}`, { headers: auth })).status, 403)
+    assert.equal(
+      (await fetch(`${rig.url}/v1/wallets/${theirs}?userId=${testUser(2)}`, { headers: auth })).status,
+      200,
+    )
+  })
+})
+
+test('THE RULE: `exported` is not a status a caller may assert', { skip }, async () => {
+  // `exported` records that the user now holds the private key. It is irreversible, it stops the
+  // treasury sweeping from the wallet and it marks the wallet self-custodied everywhere — so it is
+  // the outcome of a key export, never something a caller may declare. Before the gate, one PATCH
+  // stranded a wallet permanently, and `canTransition` allowed it because `active → exported` is a
+  // real transition; it is just not this route's to make.
+  await withServer({}, async (rig) => {
+    const writer = await sign({ sub: 'service:hub-api', scopes: [WRITE_SCOPE] })
+    const mine = await watchWalletFor(rig, writer, USER)
+    for (const status of ['exported', 'retiring', 'retired', 'provisioning']) {
+      const res = await fetch(`${rig.url}/v1/wallets/${mine}`, {
+        method: 'PATCH',
+        headers: asUser(),
+        body: JSON.stringify({ status, reason: 'ops: user asked' }),
+      })
+      assert.equal(res.status, 400, `${status} was answered ${res.status}`)
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'status_not_settable')
+    }
+    const after = await sql<{ status: string }[]>`select status from wallets where id = ${mine}`
+    assert.equal(after[0]?.status, 'active')
+  })
+})
+
+test('a freeze names who asked for it and why, and tells the user neither', { skip }, async () => {
+  await withServer({}, async (rig) => {
+    const writer = await sign({ sub: 'service:hub-api', scopes: [WRITE_SCOPE] })
+    const mine = await watchWalletFor(rig, writer, USER)
+
+    // A freeze nobody can attribute to a decision is one no reviewer can defend and no operator
+    // can safely lift, so the reason is required rather than nullable.
+    const unattributed = await fetch(`${rig.url}/v1/wallets/${mine}`, {
+      method: 'PATCH',
+      headers: asUser(),
+      body: JSON.stringify({ status: 'frozen' }),
+    })
+    assert.equal(unattributed.status, 400)
+    assert.equal(((await unattributed.json()) as { error: { code: string } }).error.code, 'bad_field')
+
+    const frozen = await fetch(`${rig.url}/v1/wallets/${mine}`, {
+      method: 'PATCH',
+      headers: asUser(),
+      body: JSON.stringify({ status: 'frozen', reason: 'ops 4102: chargeback under review' }),
+    })
+    assert.equal(frozen.status, 200)
+
+    // Read over SQL rather than from the response: the attribution is an operator record. An
+    // operator's words about an account are not owed to the account holder — that is the same
+    // disclosure #314 closed on the withdrawal row.
+    const served = await frozen.text()
+    assert.equal(/chargeback|status_actor|statusActor|status_reason/.test(served), false, served)
+    const row = await sql<{ status_actor: string | null; status_reason: string | null }[]>`
+      select status_actor, status_reason from wallets where id = ${mine}
+    `
+    assert.equal(row[0]?.status_actor, `user:${USER}`)
+    assert.match(row[0]?.status_reason ?? '', /ops 4102: chargeback under review/)
+  })
+})

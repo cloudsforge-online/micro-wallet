@@ -576,7 +576,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps, READ_SCOPE)
       const wallet = await findWallet(deps.portfolio.sql, ctx.params['id'] ?? '')
       if (!wallet) throw new BadRequestError('wallet_not_found', 'no such wallet', 404)
-      assertOwner(principal, wallet.userId)
+      assertOwner(principal, wallet.userId, requestedUser(ctx))
       const link = await readLink(deps.portfolio.sql, wallet.id)
       return { status: 200, body: { wallet, link } }
     }),
@@ -584,16 +584,23 @@ function buildRoutes(): Route[] {
     route('PATCH', '/v1/wallets/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps, WRITE_SCOPE)
       const id = ctx.params['id'] ?? ''
+      // The body is read before the row, because it carries the subject a service principal must
+      // name for `assertOwner` to have anything to check against.
+      const body = await readJson(ctx.req)
       const wallet = await findWallet(deps.portfolio.sql, id)
       if (!wallet) throw new BadRequestError('wallet_not_found', 'no such wallet', 404)
-      assertOwner(principal, wallet.userId)
+      assertOwner(principal, wallet.userId, optionalString(body, 'userId') ?? requestedUser(ctx))
 
-      const body = await readJson(ctx.req)
       let updated = wallet
       if ('label' in body) updated = await relabelWallet(deps.portfolio.sql, id, optionalString(body, 'label') ?? null)
       if (body['isPrimary'] === true) updated = await setPrimary(deps.portfolio.sql, id)
       if (typeof body['status'] === 'string') {
-        updated = await transitionWallet(deps.portfolio.sql, id, body['status'] as WalletStatus)
+        updated = await transitionWallet(deps.portfolio.sql, id, settableStatus(body['status']), {
+          actor: actorOf(principal),
+          // Required, and 400 without it. A freeze that nobody can attribute to a decision is one
+          // no reviewer can defend and no operator can safely lift.
+          reason: requireString(body, 'reason'),
+        })
       }
       return { status: 200, body: { wallet: updated } }
     }),
@@ -631,11 +638,11 @@ function buildRoutes(): Route[] {
     route('POST', '/v1/wallets/:id/authorisations', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps, WRITE_SCOPE)
       const id = ctx.params['id'] ?? ''
+      const body = await readJson(ctx.req)
       const wallet = await findWallet(deps.portfolio.sql, id)
       if (!wallet) throw new BadRequestError('wallet_not_found', 'no such wallet', 404)
-      assertOwner(principal, wallet.userId)
+      assertOwner(principal, wallet.userId, optionalString(body, 'userId') ?? requestedUser(ctx))
 
-      const body = await readJson(ctx.req)
       const authorisation = requireString(body, 'authorisation')
       if (!isAuthorisation(authorisation)) {
         throw new BadRequestError('unknown_authorisation', `not an authorisation: ${authorisation}`)
@@ -654,7 +661,7 @@ function buildRoutes(): Route[] {
       const id = ctx.params['id'] ?? ''
       const wallet = await findWallet(deps.portfolio.sql, id)
       if (!wallet) throw new BadRequestError('wallet_not_found', 'no such wallet', 404)
-      assertOwner(principal, wallet.userId)
+      assertOwner(principal, wallet.userId, requestedUser(ctx))
 
       const raw = ctx.params['authorisation'] ?? ''
       // `all` is "disconnect this wallet": revoke every authorisation and the link itself, in one
@@ -786,7 +793,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps, READ_SCOPE)
       const withdrawal = await findWithdrawal(deps.portfolio.sql, ctx.params['id'] ?? '')
       if (!withdrawal) throw new BadRequestError('withdrawal_not_found', 'no such withdrawal', 404)
-      assertOwner(principal, withdrawal.userId)
+      assertOwner(principal, withdrawal.userId, requestedUser(ctx))
       return { status: 200, body: { withdrawal } }
     }),
 
@@ -1042,9 +1049,45 @@ function actingUser(ctx: RequestContext, principal: Principal): string {
   return subjectUserId(principal, requested)
 }
 
-function assertOwner(principal: Principal, ownerUserId: string): void {
-  if (isAdmin(principal) || principal.kind === 'service') return
-  if (principal.userId !== ownerUserId) throw new ForbiddenError('acting for another user')
+/**
+ * The gate on a route keyed by a row id rather than by a user id.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **A SERVICE PRINCIPAL USED TO PASS THIS UNCONDITIONALLY, WHICH MADE `wallet:write` ESTATE-WIDE.**
+ *
+ * The scope catalogue defines `wallet:write` as "mutate non-monetary wallet state **for a named
+ * user**". This function is the code that enforces the named-user half, and `principal.kind ===
+ * 'service'` returned early before it enforced anything — so any service holding the scope could
+ * mutate any user's wallet, on any of the routes below, with no reason recorded and nothing told
+ * to the owner. Measured against the running mainnet estate at the time: no service was granted
+ * `wallet:write` at all, so nothing could reach it. That is why it was worth closing then — the
+ * next grant would have acquired the authority silently, and whoever made it would read the scope
+ * description rather than this function.
+ *
+ * A service now passes only by NAMING the user it acts for, which is `subjectUserId`'s contract and
+ * the same thing every user-keyed route in this file already requires of it. `requested` comes from
+ * the body where the route reads one and from `?userId=` where it does not.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * An admin role still passes, unchanged: an operator acting across accounts is the exception the
+ * role exists to express, and it is a role a person holds rather than a credential a service mints.
+ */
+function assertOwner(principal: Principal, ownerUserId: string, requested?: string): void {
+  if (isAdmin(principal)) return
+  if (principal.kind === 'service' && requested === undefined) {
+    // 403 rather than the 401 `subjectUserId` would raise here. The token is perfectly good; what
+    // is missing is the subject, and answering 401 tells a service whose credential is fine that
+    // its credential is not — the same mistake `statusFor` exists to stop making one hop out.
+    throw new ForbiddenError('a named user: this route acts on one user’s wallet')
+  }
+  if (subjectUserId(principal, requested) !== ownerUserId) {
+    throw new ForbiddenError('acting for another user')
+  }
+}
+
+/** The user a service says it is acting for, on a route that carries no body. */
+function requestedUser(ctx: RequestContext): string | undefined {
+  return ctx.url.searchParams.get('userId') ?? undefined
 }
 
 function actorOf(principal: Principal): Actor {
@@ -1179,6 +1222,46 @@ function requireAmount(body: Record<string, unknown>, field: string): bigint {
     )
   }
   return BigInt(value.trim())
+}
+
+/**
+ * The lifecycle states a caller may assert over HTTP. Two, out of six.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **`exported` IS NOT ONE OF THEM, AND THAT IS THE POINT OF THIS FUNCTION.**
+ *
+ * `PATCH` used to cast the body's string straight to `WalletStatus` and hand it to
+ * `transitionWallet`, which accepts anything `TRANSITIONS` permits — and `active` permits
+ * `exported`. `exported` means the user has taken the private key, and `wallets.ts` says what it
+ * costs: "Irreversible. The platform stops sweeping into treasury from it and every surface marks
+ * it self-custodied. There is no transition out, because there is no operation that can un-know a
+ * key." So the reachable worst case was not a wallet frozen by mistake, it was a wallet
+ * permanently marked self-custodied when no key ever left — `is_primary` cleared, treasury sweeps
+ * stopped, the label wrong on every surface, and no route back short of hand-written SQL.
+ * `retiring → retired` is terminal in the same way.
+ *
+ * `exported` is the OUTCOME of a key export in `custody`, not an assertion a caller gets to make,
+ * and the transition table is not the place to express that: `TRANSITIONS` describes what the
+ * lifecycle allows, this describes what the wire allows, and they are different questions.
+ * `transitionWallet` stays reachable in full from `links.ts` and from any internal path that has
+ * actually observed the thing it is recording.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * A garbage string was already safe — `canTransition` looks the target up in a frozen table — but
+ * it answered `illegal_transition` from the store, which says the wallet is in the wrong state
+ * rather than that the field will never be accepted. These are different instructions to a client.
+ */
+const SETTABLE_STATUSES: readonly WalletStatus[] = Object.freeze(['active', 'frozen'])
+
+function settableStatus(raw: string): WalletStatus {
+  if (!(SETTABLE_STATUSES as readonly string[]).includes(raw)) {
+    throw new BadRequestError(
+      'status_not_settable',
+      `status may only be set to ${SETTABLE_STATUSES.join(' or ')} here — '${raw}' is not a state a ` +
+        'caller may assert, whatever the wallet is in now',
+    )
+  }
+  return raw as WalletStatus
 }
 
 function requireChainField(body: Record<string, unknown>): ChainId {

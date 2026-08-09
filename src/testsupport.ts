@@ -88,6 +88,22 @@ export interface FakeLedger extends LedgerClient {
   readonly entries: readonly FakeEntry[]
   /** Every idempotency key it has seen, in order. The double-credit tests read this. */
   readonly keys: readonly string[]
+  /**
+   * Freeze withdrawals in an asset, the way reconciliation does.
+   *
+   * ── MODELLED, NOT ASSUMED AWAY, BECAUSE THE STRING IS THE THING UNDER TEST ──────────────────
+   *
+   * `ledger/src/reconcile.ts` writes an OPERATOR diagnostic into `asset_freezes.reason` — custody
+   * total, observed total, drift, and a per-bucket address-count breakdown — and
+   * `AssetFrozenError` interpolates it straight into `Error.message`, which this service reads as
+   * `LedgerRefusedError.message`. A fake that refused with a tidy sentence of its own would make
+   * the disclosure test pass while proving nothing, because the defect is entirely in what this
+   * service does with the ledger's actual text. Callers therefore supply the real shape.
+   *
+   * Only reservations are affected, matching `assertNotFrozen`, which returns early for any kind
+   * outside `WITHDRAWAL_KINDS`.
+   */
+  freezeWithdrawals(assetCode: LedgerAssetCode, reason: string): void
 }
 
 const accountKey = (subject: string, assetCode: string, purpose: string): string =>
@@ -98,6 +114,7 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
   const entries: FakeEntry[] = []
   const byKey = new Map<string, FakeEntry>()
   const keys: string[] = []
+  const frozen = new Map<string, string>()
   // The fake's stand-in for the real ledger's row locks. See the file header.
   let chain: Promise<unknown> = Promise.resolve()
   let counter = 0
@@ -144,6 +161,10 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
 
     credit(subject, assetCode, amount) {
       move(subject, assetCode, 'available', amount)
+    },
+
+    freezeWithdrawals(assetCode, reason) {
+      frozen.set(assetCode, reason)
     },
 
     balanceOf(subject, assetCode, purpose) {
@@ -273,6 +294,17 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
     reserve(request: ReserveRequest) {
       return serialise(() => {
         if (options.failWith) throw options.failWith()
+        const freeze = frozen.get(request.assetCode)
+        if (freeze !== undefined) {
+          // The message is `AssetFrozenError`'s own construction, spelled here rather than
+          // imported, so this stays the OTHER side of the boundary — the same rule the
+          // retired-asset guard in `postEntry` is modelled under.
+          throw new LedgerRefusedError(
+            409,
+            'asset_frozen',
+            `withdrawals in ${request.assetCode} are frozen: ${freeze}`,
+          )
+        }
         keys.push(request.idempotencyKey)
         const replay = claim(request.idempotencyKey, request)
         if (replay) return { ...(replay.response as Reservation), replayed: true }

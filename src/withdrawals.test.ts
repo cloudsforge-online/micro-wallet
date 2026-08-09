@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import type postgres from 'postgres'
 import { AddressError } from './addresses.ts'
 import { assignDepositAddress } from './deposits.ts'
+import { LedgerRefusedError } from './ledgerclient.ts'
 import { readPortfolio } from './portfolio.ts'
 import { createChallenge, grantAuthorisation, verifyChallenge } from './links.ts'
 import { SETTLEMENT_CONFIRMED, SETTLEMENT_FAILED } from './settlement.ts'
@@ -360,6 +361,101 @@ test('a paused deployment refuses with 503 rather than queueing silently', { ski
       }),
     (err: unknown) => err instanceof WithdrawalError && err.status === 503,
   )
+})
+
+/* ------------------------------------------------------------------ what a refusal says */
+
+/**
+ * The operator diagnostic `ledger/src/reconcile.ts` writes into `asset_freezes.reason`.
+ *
+ * Copied in its real shape rather than paraphrased, because the test below is about which parts of
+ * it survive the trip to a user, and a paraphrase would let a partial filter pass. Every number in
+ * it is invented; the STRUCTURE — custody total, observed total, drift, per-bucket address counts —
+ * is the one the reconciler builds.
+ */
+const OPERATOR_FREEZE_REASON =
+  'reconciliation drifted: drift 3 (custody 41000000, observed 40999997 = ' +
+  'deposit: 41000000 over 12 addresses, treasury: 0 over 1)'
+
+/** The words that are the estate's business and never the account holder's. */
+const TREASURY_WORDS = [/custody/i, /observed/i, /drift/i, /\d+ addresses/i, /41000000/, /40999997/]
+
+test('a reconciliation freeze does not tell the user the estate’s custody position', { skip }, async () => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * micro-org#314. The freeze is right; what was said about it was not.
+   *
+   * `AssetFrozenError.message` is `withdrawals in <ASSET> are frozen: <asset_freezes.reason>`, and
+   * that reason is the reconciler's arithmetic for an operator. This service rethrew it verbatim
+   * AND wrote it to `withdrawals.failure_reason`, which `GET /v1/withdrawals/:id` returns to the
+   * owner for ever after — so a freeze window could be sampled for a time series of the platform's
+   * holdings and address topology in the asset, by anyone with an account.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.freezeWithdrawals('EMBER', OPERATOR_FREEZE_REASON)
+
+  const err = await request().then(
+    () => null,
+    (e: unknown) => e,
+  )
+  assert.ok(err instanceof WithdrawalError, 'a frozen asset must refuse the withdrawal')
+  // The code still classifies it, so a client can branch and an operator can join the logs.
+  assert.equal(err.code, 'asset_frozen')
+  assert.equal(err.status, 409)
+  for (const word of TREASURY_WORDS) {
+    assert.equal(word.test(err.message), false, `the refusal returned ${word}: ${err.message}`)
+  }
+  // And it says something true and usable in its place, rather than merely saying nothing.
+  assert.match(err.message, /paused while the platform reconciles/)
+  assert.match(err.message, /not a decision about your account/)
+
+  // The durable half. This is the one that outlives the request.
+  const page = await listWithdrawals(sql as never, USER, 10, null)
+  const failed = page.withdrawals.find((w) => w.state === 'failed')
+  assert.ok(failed, 'the refusal is a durable row, so a retry replays it rather than reserving')
+  const stored = failed.failureReason ?? ''
+  assert.match(stored, /^asset_frozen: /, 'the code is kept — it is what ties the row to the log')
+  for (const word of TREASURY_WORDS) {
+    assert.equal(word.test(stored), false, `failure_reason stored ${word}: ${stored}`)
+  }
+
+  // Nothing moved. A freeze is a refusal, not a partial withdrawal.
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 10n * ONE_EMBER)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'reserved'), 0n)
+})
+
+test('an unrecognised ledger refusal says nothing the ledger wrote', { skip }, async () => {
+  // The mapping is closed and its DEFAULT is safe, so a refusal code the ledger adds tomorrow
+  // cannot leak by being unlisted here. This is the property that stops #314 coming back through
+  // a change made in another repository.
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  const deps = {
+    ...h.withdrawals,
+    ledger: {
+      ...h.ledger,
+      reserve: async () => {
+        throw new LedgerRefusedError(409, 'some_future_rule', OPERATOR_FREEZE_REASON)
+      },
+    },
+  }
+  const err = await requestWithdrawal(deps, {
+    userId: USER,
+    assetCode: 'EMBER',
+    destination: '0x1111111111111111111111111111111111111111',
+    amount: AMOUNT,
+    clientKey: 'client-key-1',
+    correlationId: 'req-1',
+    actor: `user:${USER}`,
+  }).then(
+    () => null,
+    (e: unknown) => e,
+  )
+  assert.ok(err instanceof WithdrawalError)
+  assert.equal(err.code, 'some_future_rule', 'the classification is still carried')
+  for (const word of TREASURY_WORDS) {
+    assert.equal(word.test(err.message), false, `an unmapped refusal returned ${word}`)
+  }
 })
 
 /* ------------------------------------------------------------------ settlement */

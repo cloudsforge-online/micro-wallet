@@ -414,7 +414,10 @@ export async function verifyChallenge(
       select status from wallets where id = ${challenge.wallet_id}
     `
     if (current[0]?.status === 'provisioning') {
-      await transitionWallet(tx, challenge.wallet_id, 'active')
+      await transitionWallet(tx, challenge.wallet_id, 'active', {
+        actor: `user:${input.userId}`,
+        reason: 'the owner signed the link challenge',
+      })
     }
 
     const link = await readLink(tx, challenge.wallet_id)
