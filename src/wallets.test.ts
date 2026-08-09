@@ -33,6 +33,15 @@ let h: Harness
 const USER = testUser(1)
 const OTHER = testUser(2)
 
+/**
+ * Every transition carries who and why.
+ *
+ * `StatusChange` is a required parameter rather than an optional one, so this helper is not a
+ * convenience — there is no way to call `transitionWallet` without it, which is the property
+ * micro-org#315 asked for: no wallet in this service changes lifecycle with nothing recorded.
+ */
+const by = (reason: string) => ({ actor: `user:${USER}`, reason })
+
 before(async () => {
   if (!enabled) return
   sql = openDb()
@@ -141,15 +150,15 @@ test('the lifecycle table is what §3.1 says, and export is irreversible', { ski
 
 test('a transition is checked in the row’s own UPDATE, not by a read then a write', { skip }, async () => {
   const { wallet } = await create()
-  await transitionWallet(sql as never, wallet.id, 'exported')
+  await transitionWallet(sql as never, wallet.id, 'exported', by('the owner took the key'))
   await assert.rejects(
-    () => transitionWallet(sql as never, wallet.id, 'active'),
+    () => transitionWallet(sql as never, wallet.id, 'active', by('undo')),
     (err: unknown) => err instanceof WalletError && err.code === 'illegal_transition',
   )
   // A wallet leaving service must not remain the primary one, or the next deposit assignment would
   // target a wallet the user told us to stop using.
   const primary = await create({ address: evmSigner().address, isPrimary: true })
-  const exported = await transitionWallet(sql as never, primary.wallet.id, 'exported')
+  const exported = await transitionWallet(sql as never, primary.wallet.id, 'exported', by('the owner took the key'))
   assert.equal(exported.isPrimary, false)
 })
 
@@ -211,8 +220,8 @@ test('THE RULE: the wallet list is paged, and the pages do not overlap or skip',
 
 test('a retired wallet is hidden unless asked for', { skip }, async () => {
   const { wallet } = await create()
-  await transitionWallet(sql as never, wallet.id, 'retiring')
-  await transitionWallet(sql as never, wallet.id, 'retired')
+  await transitionWallet(sql as never, wallet.id, 'retiring', by('the owner ended our use of it'))
+  await transitionWallet(sql as never, wallet.id, 'retired', by('retirement completed'))
   assert.equal((await listWallets(sql as never, { userId: USER, limit: 10 })).wallets.length, 0)
   assert.equal(
     (await listWallets(sql as never, { userId: USER, limit: 10, includeRetired: true })).wallets.length,

@@ -399,10 +399,16 @@ async function reserveAndQueue(
       //
       // The row is marked `failed` before the throw, so the refusal is durable: a client that
       // retries with the same key replays a `failed` withdrawal rather than reserving again.
+      //
+      // The ledger's CODE is carried through and its MESSAGE is not — see `refusalMessage`. Both
+      // the durable row and the thrown error take the same sentence, because `failure_reason` is
+      // read back by the owner through `GET /v1/withdrawals/:id` and a disclosure written there is
+      // permanent in a way the 409 body is not.
+      const message = refusalMessage(err.code, withdrawal.assetCode)
       await transition(deps, withdrawal.id, 'failed', {
-        failureReason: `${err.code}: ${err.message}`,
+        failureReason: `${err.code}: ${message}`,
       })
-      throw new WithdrawalError(err.code, err.message, err.status)
+      throw new WithdrawalError(err.code, message, err.status)
     }
     // The ledger could not be reached. The row stays `requested`, which is exactly right: nothing
     // is known about whether the reservation landed, and the retry job re-runs this step with the
@@ -456,6 +462,51 @@ async function reserveAndQueue(
     })
     return toWithdrawal(row)
   })
+}
+
+/**
+ * What the person who asked for the withdrawal is told when the ledger refuses it.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **KEYED ON THE REFUSAL CODE. THE UPSTREAM'S MESSAGE IS NEVER PASSED THROUGH.**
+ *
+ * The code is the ledger's classification of the refusal and is a fact about this request. The
+ * message is free text, written for whoever the ledger expected to read it next — and for one
+ * refusal that reader is an operator, not the account holder.
+ *
+ * `asset_frozen` carries `asset_freezes.reason` verbatim inside `Error.message`, and that string is
+ * the reconciliation diagnostic `ledger/src/reconcile.ts` builds for an operator: the estate's
+ * TOTAL CUSTODY POSITION in the asset, the total observed on chain, the drift between the two, and
+ * a per-bucket breakdown with address counts. Returning it answered a withdrawal request with the
+ * platform's treasury position, and `failure_reason` stored it on a row the owner can read back for
+ * ever, so sampling the endpoint across a freeze window yielded a time series of the estate's
+ * holdings and address topology with no privileged access at all. The one thing it did convey to
+ * the person reading it — that the books and the chain disagree about what the platform holds — is
+ * a solvency signal delivered without framing to a user who has done nothing wrong.
+ *
+ * The freeze itself is correct and is not weakened here: halting withdrawals when the ledger cannot
+ * prove it holds what it owes is the whole point of it. What changes is what is said about it.
+ *
+ * **The DEFAULT is the safe sentence, not the upstream text.** A refusal code the ledger adds
+ * tomorrow therefore says nothing it should not, rather than leaking until somebody notices. No
+ * detail is lost: the `LedgerRefusedError` is logged with the request's correlation id, and
+ * `GET /reconciliation` on the ledger is where the freeze reason belongs and still lives.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+function refusalMessage(code: string, assetCode: AssetCode): string {
+  switch (code) {
+    case 'asset_frozen':
+      return (
+        `withdrawals in ${assetCode} are paused while the platform reconciles its records. ` +
+        'This is not a decision about your account, and your balance is unchanged.'
+      )
+    case 'insufficient_funds':
+      return `there is not enough available ${assetCode} to cover this withdrawal`
+    case 'idempotency_key_reuse':
+      return 'this idempotency key was already used for a different withdrawal'
+    default:
+      return `this ${assetCode} withdrawal could not be reserved`
+  }
 }
 
 /* ------------------------------------------------------------------ the state machine */

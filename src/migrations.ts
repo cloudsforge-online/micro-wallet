@@ -601,6 +601,36 @@ export const MIGRATIONS: readonly Migration[] = [
       alter table platform_addresses add constraint platform_addresses_chain_ck ${CHAIN_CK_V12};
     `,
   },
+  {
+    version: 13,
+    name: 'wallet_status_attribution',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * WHO MOVED THIS WALLET'S LIFECYCLE, AND WHY.
+     *
+     * A wallet could be frozen — or driven to `exported`, which is terminal — with nothing
+     * recorded but the new value of `status`. No actor, no reason, no row anywhere saying a
+     * decision had been taken. A freeze nobody can attribute cannot be defended, cannot be
+     * reviewed and cannot be undone with any confidence that undoing it is right.
+     *
+     * Two nullable columns rather than a history table. The wallet has one status at a time and
+     * these describe the change that produced it; the sequence of changes is the outbox's job, not
+     * this table's. Nullable because every row that already exists predates the change and there is
+     * no honest value to back-fill — a manufactured actor would be a claim about who did something
+     * nobody recorded.
+     *
+     * NOT added to the wallet's public record, deliberately. `COLUMNS` in `wallets.ts` is the
+     * select list the API answers from, and these are not in it: the reason is free text an
+     * operator wrote for the estate, and routing operator free text to the account holder is
+     * exactly the defect micro-org#314 is about on the withdrawal path. The status itself is what
+     * the owner is told.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table wallets add column if not exists status_actor  text;
+      alter table wallets add column if not exists status_reason text;
+    `,
+  },
 ]
 
 /**
