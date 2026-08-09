@@ -223,6 +223,42 @@ test('the scheme is derived from the chain, never taken from the request', () =>
   assert.equal(schemeForChain('sol'), 'solana_signmessage')
   assert.equal(schemeForChain('btc'), 'bip322')
   assert.equal(schemeForChain('xrp'), 'xrp_signed_memo')
+  // The two new chains take their existing family's scheme and neither needed a case added, which
+  // is the point of switching on the family here rather than on the chain.
+  assert.equal(schemeForChain('etc'), 'eip4361')
+  assert.equal(schemeForChain('doge'), 'bip322')
+})
+
+test('ETHEREUM CLASSIC: a link message commits to 61, which is the only thing separating it from ETH', () => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * An ETC address and an ETH address are the same 20 bytes, and the same key signs for both. The
+   * chain id in the EIP-4361 message is therefore the ONLY field that distinguishes a proof of
+   * control on Ethereum Classic from one on Ethereum — there is nothing in the address, nothing in
+   * the signature and nothing in the scheme that does it.
+   *
+   * That matters because `verify` refuses a message whose `Chain ID` is not the expected one (the
+   * `a signature for another chain is refused` case above), so if these two resolved to the same
+   * number, a challenge issued for one would be satisfiable by a signature bound to the other. The
+   * numbers are asserted as being DIFFERENT rather than as being 61 and 1: the values themselves
+   * belong to `contracts-chain`, which is exact-pinned precisely so this file does not restate
+   * them, and re-typing 61 here would only prove that two literals in this repository agree.
+   *
+   * Mordor is the testnet, and the reason there is a testnet number at all: Kotti and Morden are
+   * both retired, so 63 is the only honest value and `contracts-chain` says so at length.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  for (const network of ['mainnet', 'testnet'] as const) {
+    assert.notEqual(
+      expectedChainId('etc', network),
+      expectedChainId('eth', network),
+      `ETC and ETH share a ${network} chain id — a link proof for one would satisfy the other`,
+    )
+    assert.notEqual(expectedChainId('etc', network), expectedChainId('ember', network))
+  }
+  // And the two ETC networks differ from each other, which is what stops a Mordor signature being
+  // replayed as proof of control on mainnet.
+  assert.notEqual(expectedChainId('etc', 'mainnet'), expectedChainId('etc', 'testnet'))
 })
 
 test('the EIP-191 prefix uses the BYTE length, not the character count', () => {

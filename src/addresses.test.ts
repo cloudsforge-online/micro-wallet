@@ -329,12 +329,204 @@ test('LITECOIN: an unknown bitcoin-family chain throws rather than falling back 
    * dies earlier, in `chainSpec`. The case is a chain that IS in `ASSET_FOR_CHAIN` with
    * `family: 'bitcoin'` and is NOT in the parameter table — which is precisely what the next
    * Bitcoin-derived chain looks like on the commit that adds it and forgets this file.
+   *
+   * The stand-in used to be `doge`, which is now a real row in that table — this test was written
+   * against the commit it was warning about, and that commit arrived. `bch` replaces it: Bitcoin
+   * Cash is the obvious next bitcoin-family candidate, `contracts-chain` does not carry it, and a
+   * fixture naming a chain nobody has added is the only kind that stays honest.
    */
   assert.throws(
-    () => bitcoinFamilyParams('doge' as never),
+    () => bitcoinFamilyParams('bch' as never),
     (err: Error) => err instanceof AddressError && /no bitcoin-family address parameters/.test(err.message),
   )
-  // And the two that do exist answer, so the throw above is not simply "this function always throws".
+  // And the three that do exist answer, so the throw above is not simply "this function always
+  // throws" — including the one whose answer is an EMPTY list of HRPs, which is the case a
+  // truthiness check on the returned array would have got wrong.
   assert.deepEqual([...bitcoinFamilyParams('btc').hrps], ['bc', 'tb', 'bcrt'])
   assert.deepEqual([...bitcoinFamilyParams('ltc').hrps], ['ltc', 'tltc', 'rltc'])
+  assert.deepEqual([...bitcoinFamilyParams('doge').hrps], [])
+  assert.equal(bitcoinFamilyParams('doge').versions.length, 4)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN — the bitcoin-family chain that does not have one of the family's encodings.
+ *
+ * Litecoin's lesson was that a family shares its encodings but not the PARAMETERS they are applied
+ * with. Dogecoin's is one step further: `dogecoin/dogecoin`, `src/chainparams.cpp`, read at
+ * `master` on 2026-08-09, declares no `bech32_hrp` on any network. There is no segwit here to have
+ * parameters for. A validator that answered `familyOf('doge') === 'bitcoin'` with the family's
+ * bech32 branch would accept a well-formed `doge1…` string no Dogecoin node can ever pay to and —
+ * worse, because it is the mistake a user makes rather than a developer — a real `bc1…` address.
+ *
+ * ── THE VECTORS ARE PUBLISHED, FOR THE REASON THE LITECOIN BLOCK GIVES ────────────────────────
+ *
+ * All of them come from `dogecoin/dogecoin`, `src/test/data/base58_keys_valid.json`, the file
+ * Dogecoin Core's own `base58_tests` runs against. The 20-byte hash is quoted beside each address
+ * so the pair can be re-checked against that file rather than taken on trust, and so a
+ * transcription slip shows up as a hash that does not match rather than as a green test.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** That file, `isTestnet: false`. Address → the hash160 Core decodes it to. */
+const DOGECOIN_MAINNET_VECTORS: readonly (readonly [string, string])[] = [
+  // P2PKH, version byte 30 (0x1e) → `D…`
+  ['DD4KSSuBJqcjuTcvUg1CgUKeurPUFeEZkE', '56d9b1d684d5abef32134ebc6883d75d3a53e9be'],
+  ['DBjW6kna7rUPE4Mj9j4B3oK3xVA1SDHrdt', '485290865b407657e0aedbdbb4aa6618310af50d'],
+  ['DGYdw7jC17b9SappjsrAsaghhDTS8sV5Mx', '7d1d283ff32f3a425ea22d21032e1bca7d14efaa'],
+  // P2SH, version byte 22 (0x16). It spans two leading characters, `9…` and `A…`, so both are
+  // here: a first-character check would have accepted one of these and refused the other, and
+  // passed the whole suite on the strength of the one it accepted.
+  ['A7HRQk3GFCW2QasvdZxXuYj8kkQK5QrYLs', 'a2dd71f34fe73314d6e37c44035513f203aa400b'],
+  ['9zYnVRaekPtdKBYuPw5QiBtv3NNrzD2LLW', '58fc66bf64b3c8d8accd80110bb6df6c13735937'],
+] as const
+
+/** The same file, `isTestnet: true`. P2PKH is 113 (0x71) → `n…`; P2SH is 196 (0xc4) → `2…`. */
+const DOGECOIN_TESTNET_VECTORS: readonly (readonly [string, string])[] = [
+  ['nhRsrUaxZou6sewjqaS37cJrMRJRgwVXdk', '9131c29384f000c0d651660eefaf1717c8ca1855'],
+  ['ngbSgr1dhCqsLg6Z5tpsaCspwrH72x2Zk3', '8808c94daaa2e4f53102703b2c3de534d670e87e'],
+  ['2MsvyG12kxxipe276Au4zKqvd2xdrBuHWb3', '078457e357c6c4d8736515d14482089dd2a1f9f8'],
+] as const
+
+test("DOGECOIN: Core's own published address vectors are accepted, on both networks", () => {
+  for (const [address] of [...DOGECOIN_MAINNET_VECTORS, ...DOGECOIN_TESTNET_VECTORS]) {
+    assert.equal(isValidAddress('doge', address), true, `refused Core's own vector ${address}`)
+  }
+})
+
+test('DOGECOIN: a Bitcoin or Litecoin address is REFUSED on the Dogecoin path', () => {
+  for (const address of BITCOIN_VECTORS) {
+    // The one exception is deliberate and gets its own test below: testnet P2SH is version 196 on
+    // both chains, so that string genuinely is a valid address on each.
+    if (address === '2NC2hEhe28ULKAJkW5MjZ3jtTMJdvXmByvK') continue
+    // Valid on its own chain, which is what makes it dangerous rather than merely wrong.
+    assert.equal(isValidAddress('btc', address), true, `${address} is not a valid BTC address`)
+    assert.equal(
+      isValidAddress('doge', address),
+      false,
+      `${address} is a Bitcoin address and was accepted as a Dogecoin destination`,
+    )
+  }
+  for (const [address] of LITECOIN_MAINNET_VECTORS) {
+    assert.equal(isValidAddress('ltc', address), true, `${address} is not a valid LTC address`)
+    assert.equal(isValidAddress('doge', address), false, `${address} was accepted as Dogecoin`)
+  }
+})
+
+test('DOGECOIN: a Dogecoin address is refused on Bitcoin and Litecoin, which is the same rule', () => {
+  for (const [address] of DOGECOIN_MAINNET_VECTORS) {
+    assert.equal(isValidAddress('btc', address), false, `${address} was accepted as Bitcoin`)
+    assert.equal(isValidAddress('ltc', address), false, `${address} was accepted as Litecoin`)
+  }
+  // Testnet P2PKH too, and this is the near miss worth pinning: Dogecoin's 113 is two away from
+  // Bitcoin's and Litecoin's 111, close enough that all three can print a leading `n`. The version
+  // byte is the only thing separating them, so a check that looked at the first character would
+  // pass this and be wrong.
+  const dogeTestnetP2pkh = DOGECOIN_TESTNET_VECTORS[0]![0]
+  assert.equal(dogeTestnetP2pkh.startsWith('n'), true)
+  assert.equal(isValidAddress('doge', dogeTestnetP2pkh), true)
+  assert.equal(isValidAddress('btc', dogeTestnetP2pkh), false, 'the 113/111 gap is not being checked')
+  assert.equal(isValidAddress('ltc', dogeTestnetP2pkh), false, 'the 113/111 gap is not being checked')
+})
+
+test('DOGECOIN: there is no bech32, so a `doge1…` string is not an address at all', () => {
+  /*
+   * The assertion that separates "Dogecoin was given no HRP" from "Dogecoin was given an empty one
+   * and something else quietly fills it in".
+   *
+   * BIP-173's own published vector with its human-readable part rewritten to `doge` and the data
+   * part left byte-for-byte alone — the same mutation the Litecoin HRP test performs, for the
+   * opposite reason. There it must fail because the HRP is inside the checksum. Here it must fail
+   * because there is no bech32 branch for this chain to enter under any HRP whatever.
+   */
+  const bip173 = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'
+  const relabelled = `doge1${bip173.slice('bc1'.length)}`
+  assert.equal(isValidAddress('doge', relabelled), false, 'a doge1… string was accepted')
+  // And a REAL segwit address of another chain in this family is refused with a message that names
+  // that chain, rather than dying as an undecodable base58 payload. This is the paste a user
+  // actually makes, and `HRP_OWNER` is what makes the error say so.
+  assert.throws(
+    () => canonicaliseAddress('doge', bip173),
+    (err: Error) => err instanceof AddressError && /BTC address/.test(err.message),
+  )
+  assert.throws(
+    () => canonicaliseAddress('doge', 'ltc1qhdhvrwe6rgqns8fz28tee0hphr5x7ulw5exv4w'),
+    (err: Error) => err instanceof AddressError && /LTC address/.test(err.message),
+  )
+})
+
+test('DOGECOIN: the refusal names the version byte, so a wrong-chain paste is explicable', () => {
+  assert.throws(
+    () => canonicaliseAddress('doge', '1FsSia9rv4NeEwvJ2GvXrX7LyxYspbN2mo'),
+    (err: Error) => err instanceof AddressError && /version byte 0\b/.test(err.message),
+  )
+  // Litecoin mainnet P2PKH, version 48.
+  assert.throws(
+    () => canonicaliseAddress('doge', 'LT2KVaAy1ppRuxRgrS5RNU3vBsy7RibPeA'),
+    (err: Error) => err instanceof AddressError && /version byte 48\b/.test(err.message),
+  )
+})
+
+test('DOGECOIN: the testnet P2SH collision with Bitcoin is REAL, and is asserted rather than hidden', () => {
+  /*
+   * Dogecoin testnet and Bitcoin testnet share `SCRIPT_ADDRESS` = 196. A `2…` testnet P2SH address
+   * is byte-for-byte both chains' and nothing can tell them apart — a property of the two chains
+   * and not of this code, the same shape of unclosable collision as Litecoin's 111 one section up.
+   *
+   * Pinned here so the 0xc4 that now appears in two rows of `BITCOIN_FAMILY_PARAMS` reads as
+   * deliberate rather than as a copy-paste, and so anyone who "fixes" it has to delete this and say
+   * why. It does not exist on mainnet, where Dogecoin's 22 and Bitcoin's 5 are disjoint, and
+   * mainnet is where the value is.
+   */
+  const sharedTestnet = '2MsvyG12kxxipe276Au4zKqvd2xdrBuHWb3'
+  assert.equal(isValidAddress('doge', sharedTestnet), true)
+  assert.equal(isValidAddress('btc', sharedTestnet), true)
+  // Litecoin is NOT in this collision: its testnet P2SH is SCRIPT_ADDRESS2 = 58, and 196 is
+  // deliberately absent from its row for the reason the `3…` paragraph in `addresses.ts` gives.
+  assert.equal(isValidAddress('ltc', sharedTestnet), false)
+})
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * ETHEREUM CLASSIC — nothing about the ADDRESS is new, and that is the finding rather than a gap
+ * in the tests below.
+ *
+ * ETC shares Ethereum's address format entirely: 20 bytes, EIP-55, and no chain identifier inside
+ * the string. So there is no wrong-chain paste for this file to catch and no parameter table to
+ * get wrong — an ETC address and an ETH address are the same bytes and the same key controls both.
+ *
+ * What differs is the CHAIN ID, which is what an EIP-4361 link message commits to and which
+ * `siwe.ts` reads out of `contracts-chain` rather than restating, and the GAS MODEL, which is
+ * custody's problem and not this service's (`custody/src/chains.ts`, `isLegacyGasOnlyChain`).
+ * These tests therefore assert that the reading happens and never what the number is.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+test('ETHEREUM CLASSIC: it uses the EVM rules, and an ETH address is the same account', () => {
+  assert.equal(familyOf('etc'), 'evm')
+  assert.equal(familyOf('etc'), familyOf('eth'))
+  const lower = '0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed'
+  const checksummed = '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed'
+  for (const chain of ['eth', 'etc'] as const) {
+    const canonical = canonicaliseAddress(chain, lower)
+    assert.equal(canonical.address, checksummed)
+    assert.equal(canonical.key, lower)
+  }
+  // Mixed case is still held to its checksum, exactly as it is for ETH. The point is that ETC
+  // inherits the whole rule, not that it is exempt from the strict half of it.
+  assert.equal(isValidAddress('etc', '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD'), false)
+  // And it is not on the bitcoin-family path, so asking for parameters it has none of must throw
+  // rather than answer Bitcoin's.
+  assert.throws(() => bitcoinFamilyParams('etc' as never), AddressError)
+})
+
+test('the two new assets resolve to chains, which is what makes them reachable at all', () => {
+  // The same gap `chainForAsset('LTC')` closed: a null here makes `requestWithdrawal` answer 422
+  // not_withdrawable and `assignDepositAddress` 400 not_depositable for an asset the ledger can
+  // already hold a balance in, which presents as an outage rather than as an unwired chain.
+  assert.equal(chainForAsset('DOGE'), 'doge')
+  assert.equal(chainForAsset('ETC'), 'etc')
+  // Read from the exact-pinned package and never restated. DOGE is eight like Bitcoin's, ETC is
+  // eighteen like Ethereum's, and crediting either at the other's scale is off by ten orders of
+  // magnitude in the direction of giving money away.
+  assert.equal(decimalsOf('doge'), 8)
+  assert.equal(decimalsOf('etc'), 18)
 })

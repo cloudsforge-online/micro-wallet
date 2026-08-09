@@ -48,6 +48,18 @@ const NETWORK_CK = `check (network in ('mainnet','testnet'))`
 /** The chains after migration 10. Kept beside the above so the pair is read together. */
 const CHAIN_CK_V10 = `check (chain in ('ember','eth','btc','sol','xrp','ltc'))`
 
+/**
+ * The chains after migration 12, adding `doge` and `etc`.
+ *
+ * A THIRD CONSTANT RATHER THAN AN EDIT OF THE SECOND, for exactly the reason the second exists:
+ * `CHAIN_CK_V10` is interpolated into migration 10's `up`, that text is checksummed, and every
+ * database in the estate has already applied it. Changing the string would change migration 10's
+ * text and `@cloudsforge/db` would refuse to run at all — not refuse this change, refuse the whole
+ * migrator, on every deployment. The list of these constants only ever grows, and each one names
+ * the migration it belongs to so a reader can tell which is live without reading the array.
+ */
+const CHAIN_CK_V12 = `check (chain in ('ember','eth','btc','sol','xrp','ltc','doge','etc'))`
+
 export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -533,6 +545,60 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists outbox_relayable_idx
         on outbox (occurred_at)
         where published_at is null and quarantined_at is null;
+    `,
+  },
+  {
+    version: 12,
+    name: 'dogecoin_and_ethereum_classic',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * `doge` and `etc`, in the same five places migration 10 named a chain.
+     *
+     * Structurally identical to migration 10 and deliberately so — same drop-then-add, same
+     * `if exists` on the drop and unconditional add, same validating scan for the same reason
+     * (these tables hold thousands of rows, and a `not valid` constraint would leave the schema
+     * claiming a guarantee it had not checked). What is worth saying is why it is a separate
+     * migration at all rather than a widened `CHAIN_CK_V10`: that constant's text is inside
+     * migration 10's checksum, so editing it would make `@cloudsforge/db` refuse to run against
+     * every database that has already applied it, which is all of them.
+     *
+     * **THIS CONSTRAINT IS NOT A FEATURE FLAG, AND WIDENING IT ENABLES NOTHING.** A row reaches
+     * these tables only through a request that got past a gate this migration does not touch.
+     * Deposits ask `observability.observe`, which asks the indexer, and `INDEXER_CHAINS` follows
+     * neither of these two — so it answers `not_followed` and `assignDepositAddress` refuses 422
+     * before anything is written. Withdrawals ask `staticFeeQuoter`, which throws for an asset
+     * absent from `WALLET_FEE_QUOTES`, and neither is in it — so `requestWithdrawal` answers 503
+     * `fee_unavailable`, again before any insert. Both gates are fail-closed by construction and
+     * both are operator configuration rather than code.
+     *
+     * What the constraint decides is what happens on the day somebody DOES point the estate at a
+     * Dogecoin or an Ethereum Classic node. Without this, the first legitimate insert fails with a
+     * 23514 naming a constraint rather than a chain — after custody has already minted and
+     * published a key for an address the row was meant to record. The constraint is here to catch
+     * a chain nobody meant to write, and these two are now chains somebody may mean to write.
+     *
+     * `network` is untouched. Mordor is Ethereum Classic's testnet and Dogecoin's is called
+     * testnet3; both are `testnet` here, because this column names the estate's two environments
+     * and not the chain's own name for them — the same way `tb`/`tltc` collapse to one value.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table wallets drop constraint if exists wallets_chain_ck;
+      alter table wallets add constraint wallets_chain_ck ${CHAIN_CK_V12};
+
+      alter table deposit_address_assignments
+        drop constraint if exists deposit_address_assignments_chain_ck;
+      alter table deposit_address_assignments
+        add constraint deposit_address_assignments_chain_ck ${CHAIN_CK_V12};
+
+      alter table deposit_credits drop constraint if exists deposit_credits_chain_ck;
+      alter table deposit_credits add constraint deposit_credits_chain_ck ${CHAIN_CK_V12};
+
+      alter table withdrawals drop constraint if exists withdrawals_chain_ck;
+      alter table withdrawals add constraint withdrawals_chain_ck ${CHAIN_CK_V12};
+
+      alter table platform_addresses drop constraint if exists platform_addresses_chain_ck;
+      alter table platform_addresses add constraint platform_addresses_chain_ck ${CHAIN_CK_V12};
     `,
   },
 ]

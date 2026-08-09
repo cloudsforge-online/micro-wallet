@@ -338,10 +338,15 @@ test('a spend may name a live asset explicitly', { skip }, async () => {
 
 test('a spend naming an asset the estate does not know is refused', { skip }, async () => {
   await withServer({}, async (rig) => {
+    // `BCH`, not `DOGE`. DOGE was the stand-in until `contracts-chain` added it as a real asset,
+    // at which point this case stopped testing the unknown-asset branch and started testing the
+    // insufficient-balance one — it failed with a 409 rather than passing quietly, which is the
+    // only reason it was noticed. Bitcoin Cash is the nearest plausible asset code the estate does
+    // not carry; if it is ever added, this fixture has to move again and will say so the same way.
     const res = await fetch(`${rig.url}/v1/spend`, {
       method: 'POST',
       headers: asUser({ 'idempotency-key': 'unknown-1' }),
-      body: JSON.stringify({ amount: '100', reason: 'x', assetCode: 'DOGE' }),
+      body: JSON.stringify({ amount: '100', reason: 'x', assetCode: 'BCH' }),
     })
     assert.equal(res.status, 400)
     assert.equal(((await res.json()) as { error?: { code?: string } }).error?.code, 'unknown_asset')

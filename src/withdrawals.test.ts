@@ -607,3 +607,139 @@ test('LITECOIN: a deposit address can be assigned, which is the other half of th
   assert.equal(assignment.chain, 'ltc')
   assert.equal(assignment.assetCode, 'LTC')
 })
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * DOGECOIN AND ETHEREUM CLASSIC, THROUGH THE WHOLE REQUEST PATH.
+ *
+ * The same argument the Litecoin block above makes, and it is worth repeating rather than pointing
+ * at, because the thing being proved is not the validator: `addresses.test.ts` does that against
+ * Core's published vectors. What these prove is that the SERVICE uses it — the asset gate
+ * (`chainForAsset`), the address gate (`canonicaliseAddress`) and MIGRATION 12 are three separate
+ * places that each had to learn these two chains, and a green unit suite says nothing about any of
+ * them.
+ *
+ * **Migration 12 is invisible to every other test in this file.** `chain = 'doge'` violates the
+ * check constraint migration 10 shipped with, and the insert below is the only thing that finds
+ * out. That is exactly how migration 10 was proved, and it is why these are database tests rather
+ * than more assertions in `addresses.test.ts`.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** Dogecoin Core's own published vector, `src/test/data/base58_keys_valid.json`, `isTestnet: true`. */
+const DOGE_DESTINATION = 'nhRsrUaxZou6sewjqaS37cJrMRJRgwVXdk'
+
+test('DOGECOIN: a withdrawal is accepted and the row carries chain doge', { skip }, async () => {
+  // The fee table is per asset and DOGE is absent from every deployed one, which is a fail-closed
+  // 503 `fee_unavailable` rather than a guess — so the quote has to be supplied here to reach the
+  // part of the path this test is about.
+  const doge = harness(sql, { fees: { DOGE: 200n } })
+  doge.ledger.credit(`user:${USER}`, 'DOGE', 1_000_000n)
+  const { withdrawal } = await requestWithdrawal(doge.withdrawals, {
+    userId: USER,
+    assetCode: 'DOGE',
+    destination: DOGE_DESTINATION,
+    amount: 100_000n,
+    clientKey: 'doge-1',
+    correlationId: 'req-doge',
+    actor: `user:${USER}`,
+  })
+
+  assert.equal(withdrawal.chain, 'doge')
+  assert.equal(withdrawal.assetCode, 'DOGE')
+  // Base58, and stored byte-for-byte. Unlike a bech32 destination it is NOT lower-cased, because
+  // case is significant in base58check — lower-casing this address would change the payload and
+  // fail the checksum, which is why `canonicaliseBitcoinFamily` only folds case on the bech32 path.
+  assert.equal(withdrawal.destination, DOGE_DESTINATION)
+
+  const rows = await sql<{ chain: string }[]>`select chain from withdrawals where id = ${withdrawal.id}`
+  assert.equal(rows[0]?.chain, 'doge', 'migration 12 did not widen withdrawals_chain_ck')
+})
+
+test('DOGECOIN: a segwit destination is refused, because Dogecoin has no segwit at all', { skip }, async () => {
+  /*
+   * The Litecoin case one section up refuses a Bitcoin address for a Litecoin withdrawal. This is
+   * the stronger version of it: `tltc1…` is not merely the wrong chain's address, it is a FORM
+   * Dogecoin does not have. `src/chainparams.cpp` declares no bech32 HRP on any network, so there
+   * is no Dogecoin string of this shape for a user to have meant, and accepting one would reserve
+   * their balance against an output that cannot exist.
+   */
+  const doge = harness(sql, { fees: { DOGE: 200n } })
+  for (const destination of [LTC_DESTINATION, BTC_DESTINATION]) {
+    await assert.rejects(
+      () =>
+        requestWithdrawal(doge.withdrawals, {
+          userId: USER,
+          assetCode: 'DOGE',
+          destination,
+          amount: 100_000n,
+          clientKey: `doge-${destination}`,
+          correlationId: 'req-doge',
+          actor: `user:${USER}`,
+        }),
+      AddressError,
+      `${destination} was accepted as a Dogecoin destination`,
+    )
+  }
+  // Nothing was written, so the refusal is genuinely before the row and before the reservation.
+  const rows = await sql<{ id: string }[]>`select id from withdrawals`
+  assert.equal(rows.length, 0)
+})
+
+test('DOGECOIN: a deposit address can be assigned, which is the other half of the gap', { skip }, async () => {
+  const doge = harness(sql)
+  const assignment = await assignDepositAddress(doge.deposits, {
+    userId: USER,
+    assetCode: 'DOGE',
+    correlationId: 'req-doge',
+  })
+  assert.equal(assignment.chain, 'doge')
+  assert.equal(assignment.assetCode, 'DOGE')
+  // The fake custody answers from a pool of Dogecoin Core's published testnet vectors, so this
+  // address survived `canonicaliseAddress` on the Dogecoin path rather than on a permissive one.
+  assert.equal(assignment.address.startsWith('n'), true)
+})
+
+test('ETHEREUM CLASSIC: a withdrawal carries chain etc and never eth', { skip }, async () => {
+  /*
+   * ETC's address IS Ethereum's, so nothing in the destination distinguishes the two and the
+   * `chain` column is the only thing that routes this payment to the right network. Reserving a
+   * user's ETC and then settling it on Ethereum is a payment to an address they may not control on
+   * that chain, from a balance they will not get back — so the column is asserted from the
+   * database rather than from the returned record.
+   */
+  const etc = harness(sql, { fees: { ETC: 21_000_000_000_000n } })
+  etc.ledger.credit(`user:${USER}`, 'ETC', 10n * ONE_EMBER)
+  const destination = '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed'
+  const { withdrawal } = await requestWithdrawal(etc.withdrawals, {
+    userId: USER,
+    assetCode: 'ETC',
+    destination,
+    amount: AMOUNT,
+    clientKey: 'etc-1',
+    correlationId: 'req-etc',
+    actor: `user:${USER}`,
+  })
+
+  assert.equal(withdrawal.chain, 'etc')
+  assert.equal(withdrawal.assetCode, 'ETC')
+  // Display form is EIP-55 and the comparison form is lower-cased, the same as every other EVM
+  // chain — the whole of this file's two-forms rule applies unchanged.
+  assert.equal(withdrawal.destination, destination)
+
+  const rows = await sql<{ chain: string; destination_key: string }[]>`
+    select chain, destination_key from withdrawals where id = ${withdrawal.id}
+  `
+  assert.equal(rows[0]?.chain, 'etc', 'migration 12 did not widen withdrawals_chain_ck')
+  assert.equal(rows[0]?.destination_key, destination.toLowerCase())
+})
+
+test('ETHEREUM CLASSIC: a deposit address can be assigned', { skip }, async () => {
+  const etc = harness(sql)
+  const assignment = await assignDepositAddress(etc.deposits, {
+    userId: USER,
+    assetCode: 'ETC',
+    correlationId: 'req-etc',
+  })
+  assert.equal(assignment.chain, 'etc')
+  assert.equal(assignment.assetCode, 'ETC')
+})
