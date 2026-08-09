@@ -87,3 +87,98 @@ test('every chain-scoped table constrains its network', () => {
     }
   }
 })
+
+test('a chain widening reaches EVERY table that constrains a chain, or it reaches none of them', () => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * The failure this catches is a HALF-APPLIED widening, and it is silent until money moves.
+   *
+   * Five tables carry a `chain` check constraint, and they are not exercised evenly: a new chain
+   * touches `deposit_address_assignments` on the first deposit and `withdrawals` only when someone
+   * withdraws, which may be weeks later. So a migration that widens four of the five leaves a
+   * constraint that fires on a legitimate insert, long after the change looked complete, with a
+   * 23514 naming a constraint rather than a chain — and by then custody has already minted and
+   * published a key.
+   *
+   * Asserted as SET EQUALITY against the tables that declare such a constraint, rather than
+   * against a list written here, so a sixth chain-scoped table added later is covered without this
+   * test being edited. `create table` blocks and `alter table … add constraint` statements are both
+   * read, because a table may acquire its constraint either way.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  const constrained = new Set<string>()
+  for (const migration of MIGRATIONS) {
+    for (const [, table] of migration.up.matchAll(/constraint (\w+)_chain_ck check \(chain in/g)) {
+      constrained.add(table!)
+    }
+  }
+  assert.ok(constrained.size >= 5, `only ${constrained.size} tables constrain their chain`)
+
+  for (const migration of MIGRATIONS) {
+    const widened = new Set(
+      [...migration.up.matchAll(/add constraint (\w+)_chain_ck check \(chain in/g)].map(([, t]) => t!),
+    )
+    // A migration that widens nothing is not this migration's business; one that widens anything
+    // must widen everything, because the constraints are one rule split across five tables.
+    if (widened.size === 0) continue
+    assert.deepEqual(
+      [...widened].sort(),
+      [...constrained].sort(),
+      `migration ${migration.version} (${migration.name}) widens some chain constraints and not others`,
+    )
+  }
+})
+
+test('each chain constraint literal is used by exactly one migration, so none can be edited in place', () => {
+  /*
+   * The rule the header of `migrations.ts` states, asserted rather than left to a comment.
+   *
+   * `CHAIN_CK_V10`'s text is inside migration 10's checksum. Widening that constant to add a chain
+   * — the obvious edit, and the one this test exists to make impossible to land quietly — would
+   * change migration 10's text, and `@cloudsforge/db` would then refuse to run the migrator at all
+   * against every database that has already applied it, which is all of them. The visible symptom
+   * is not "the new chain does not work", it is "the service will not start".
+   *
+   * Two migrations sharing one WIDENING literal is the signature of that edit, because the shared
+   * list is what the second migration would have widened. Distinct lists are the evidence that each
+   * release added a constant instead.
+   *
+   * Only `alter table … add constraint` is read. The original list is legitimately shared by the
+   * four migrations that CREATE these tables — those are one set of chains written once, not a
+   * widening applied twice — and demanding four distinct literals there would be demanding four
+   * copies of the same list.
+   */
+  const widenings = new Map<string, number[]>()
+  const created = new Set<string>()
+  for (const migration of MIGRATIONS) {
+    for (const [, list] of migration.up.matchAll(
+      /add constraint \w+_chain_ck check \(chain in \(([^)]*)\)\)/g,
+    )) {
+      const versions = widenings.get(list!) ?? []
+      if (!versions.includes(migration.version)) versions.push(migration.version)
+      widenings.set(list!, versions)
+    }
+    for (const [, list] of migration.up.matchAll(
+      /\n\s+constraint \w+_chain_ck check \(chain in \(([^)]*)\)\)/g,
+    )) {
+      created.add(list!)
+    }
+  }
+  assert.ok(widenings.size >= 2, 'fewer than two chains have ever been added; this proves nothing yet')
+  for (const [list, versions] of widenings) {
+    assert.equal(
+      versions.length,
+      1,
+      `the chain list ${list} is added by migrations ${versions.join(' and ')} — a released ` +
+        'migration was edited in place instead of a new constant being added',
+    )
+    // And a widening must never reuse the list the tables were created with, which is the same
+    // edit seen from the other end: it would mean the create-table constant had been changed and
+    // the alter left pointing at it.
+    assert.equal(
+      created.has(list),
+      false,
+      `the chain list ${list} is both a create-table constraint and a widening`,
+    )
+  }
+})

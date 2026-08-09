@@ -400,6 +400,13 @@ export interface FakeCustody extends CustodyClient {
  * (`litecoin/src/test/data/key_io_valid.json`, chain `test`) rather than strings shaped to look
  * right. A fake that answers a plausible-looking address would let a canonicaliser with the wrong
  * parameters pass, which is the exact defect these tests exist to catch.
+ *
+ * The Dogecoin entries hold to the same rule and come from Dogecoin Core's own
+ * `src/test/data/base58_keys_valid.json`, the file its `base58_tests` runs against, filtered to
+ * `isTestnet: true` and `addrType: pubkey` — version byte 113, which is what custody derives for
+ * this chain because Dogecoin has no segwit to derive instead. A `tltc1…`-shaped string with
+ * `doge` in front of it would be exactly the plausible-looking answer this comment warns about,
+ * and there is no such thing.
  */
 const CHAIN_ADDRESSES: Partial<Record<ChainId, readonly string[]>> = {
   ltc: [
@@ -407,6 +414,7 @@ const CHAIN_ADDRESSES: Partial<Record<ChainId, readonly string[]>> = {
     'tltc1quf7ycjczjpjd6u9a8mpa00jl7g9aplhy8e0vf7',
   ],
   btc: ['tb1qcrh3yqn4nlleplcez2yndq2ry8h9ncg3qh7n54'],
+  doge: ['nhRsrUaxZou6sewjqaS37cJrMRJRgwVXdk', 'ngbSgr1dhCqsLg6Z5tpsaCspwrH72x2Zk3'],
 }
 
 export function fakeCustody(): FakeCustody {

@@ -52,6 +52,14 @@
  * unknown bitcoin-family chain THROWS rather than falling back to Bitcoin's. A default there is the
  * bug, not a convenience: the next Bitcoin-derived chain added to `ChainId` would silently accept
  * Bitcoin addresses under its own name and nothing would fail until somebody sent money.
+ *
+ * `doge` is that next chain, and it makes the point harder than Litecoin did. Litecoin shares the
+ * ENCODINGS and differs only in the parameters; **Dogecoin does not have one of the encodings at
+ * all.** `src/chainparams.cpp` declares no bech32 HRP on any network, so `doge1…` is not a Dogecoin
+ * address in a form this service does not accept — it is not a Dogecoin address, and a validator
+ * that answered the family's rules would accept a string no Dogecoin node can ever pay to. The
+ * table below carries an explicitly empty `hrps` for it, which is why the branch is unreachable
+ * rather than merely unused.
  */
 
 import { createHash } from 'node:crypto'
@@ -70,7 +78,7 @@ import { keccak256 } from './keccak.ts'
  * `shard` is deliberately absent: SHARD is in `CHAINS` only so that record is total, it never
  * exists on a chain, and a deposit address for it could only ever be a lie.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
+export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc' | 'doge' | 'etc'
 
 export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
   'ember',
@@ -79,6 +87,8 @@ export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
   'sol',
   'xrp',
   'ltc',
+  'doge',
+  'etc',
 ])
 
 const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
@@ -88,6 +98,8 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   sol: 'SOL',
   xrp: 'XRP',
   ltc: 'LTC',
+  doge: 'DOGE',
+  etc: 'ETC',
 })
 
 const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.freeze({
@@ -97,6 +109,8 @@ const CHAIN_FOR_ASSET: Readonly<Partial<Record<AssetCode, ChainId>>> = Object.fr
   SOL: 'sol',
   XRP: 'xrp',
   LTC: 'ltc',
+  DOGE: 'doge',
+  ETC: 'etc',
 })
 
 export function isChainId(value: string): value is ChainId {
@@ -153,6 +167,14 @@ const CUSTODY_CHAIN: Readonly<Record<ChainId, string>> = Object.freeze({
   sol: 'solana',
   xrp: 'xrp',
   ltc: 'litecoin',
+  doge: 'dogecoin',
+  // Hyphenated, and NOT `ethereumclassic` or `etc`. Custody's `CHAIN_ASSET` keys on the long name
+  // and answers 400 `unknown_chain` to anything else, and the long name it chose is the one the
+  // rest of the estate already spells this way — the chain datadir is `/data/chains/
+  // ethereum-classic` and `pricing`'s CoinGecko id is `ethereum-classic`. Two of the eight entries
+  // in this table now differ from the slug by more than a lengthening, which is the argument for a
+  // table rather than a transformation restated.
+  etc: 'ethereum-classic',
 })
 
 export function custodyChainOf(chain: ChainId): string {
@@ -198,8 +220,10 @@ export function canonicaliseAddress(chain: ChainId, raw: string): CanonicalAddre
     case 'ember':
       return canonicaliseEvm(trimmed)
     case 'bitcoin':
-      // THE CHAIN, not the family. See the header: `btc` and `ltc` are both `'bitcoin'` here and
-      // they accept disjoint sets of addresses on mainnet.
+      // THE CHAIN, not the family. See the header: `btc`, `ltc` and `doge` are all `'bitcoin'`
+      // here and they accept disjoint sets of addresses on mainnet. `doge` is the case that makes
+      // the distinction impossible to miss — it has no segwit at all, so the family's own bech32
+      // branch is one it must never take.
       return canonicaliseBitcoinFamily(chain, trimmed)
     case 'xrp':
       return canonicaliseXrp(trimmed)
@@ -415,6 +439,42 @@ const BITCOIN_FAMILY_PARAMS: Readonly<Record<string, BitcoinFamilyParams>> = Obj
     hrps: Object.freeze(['ltc', 'tltc', 'rltc']),
     /** 48 → `L…`; 50 → `M…` (SCRIPT_ADDRESS2, the one Core encodes); 111 and 58 → testnet. */
     versions: Object.freeze([0x30, 0x32, 0x6f, 0x3a]),
+  }),
+  doge: Object.freeze({
+    /**
+     * **EMPTY, AND THAT IS THE ENTRY — DOGECOIN HAS NO BECH32 AND NO SEGWIT.**
+     *
+     * `dogecoin/dogecoin`, `src/chainparams.cpp`, read at `master` on 2026-08-09, contains no
+     * `bech32_hrp` line at all — not for main, not for test, not for regtest. There is nothing to
+     * put here, and the absence has to be written down because an empty array is otherwise
+     * indistinguishable from an unfinished one.
+     *
+     * The consequence is not cosmetic. `contracts-chain`'s DOGE spec makes the same point from the
+     * other side: a consumer that derives an HRP by pattern-matching LTC's `ltc1` against BTC's
+     * `bc1` produces `doge1…` strings that no Dogecoin node will ever pay to. With no HRP in this
+     * array, `canonicaliseBitcoinFamily` never takes its bech32 branch for `doge`, so a segwit-
+     * shaped string cannot be accepted here whatever its checksum says, and a `bc1…` or `ltc1…`
+     * pasted into a Dogecoin withdrawal is named as the other chain's by `HRP_OWNER` rather than
+     * failing as a bad base58 payload.
+     */
+    hrps: Object.freeze([]),
+    /**
+     * From the same file. 30 (`0x1e`) → `D…`; 22 (`0x16`) → `9…`/`A…`; 113 (`0x71`) → `n…` testnet;
+     * 196 (`0xc4`) → `2…` testnet. Each is quoted against a vector in `addresses.test.ts` taken
+     * from Dogecoin Core's own `src/test/data/base58_keys_valid.json`, and they are the same four
+     * bytes custody derives and signs under (`custody/src/chains.ts`, `DOGECOIN_MAINNET`).
+     *
+     * **THERE IS NO SECOND P2SH PREFIX TO CHOOSE BETWEEN**, unlike Litecoin, whose 5-versus-50 pair
+     * is the paragraph above. Dogecoin has one `SCRIPT_ADDRESS` per network and Core both encodes
+     * and decodes it, so admitting 22 costs nothing and refusing it would refuse an address Core
+     * itself prints.
+     *
+     * On MAINNET all four of these are disjoint from Bitcoin's and Litecoin's, so the wrong-chain
+     * paste that costs money is caught. On TESTNET, 196 is shared with Bitcoin — the same shape of
+     * unclosable collision as Litecoin's 111 one paragraph up, asserted rather than hidden in
+     * `addresses.test.ts` for the same reason, and confined to a network that carries no value.
+     */
+    versions: Object.freeze([0x1e, 0x16, 0x71, 0xc4]),
   }),
 })
 

@@ -289,7 +289,11 @@ test('THE CHAIN ON THE WIRE IS CUSTODY NAME, NOT THIS SERVICE SLUG', async () =>
    * **The reason no test saw it is the reason this case exists: the test above pins `ember`, and
    * `ember` is one of the two slugs that happens to equal its own chain name.** A contract test
    * that exercises one value proves the contract for one value. Every disagreeing chain is
-   * asserted below, so adding a seventh chain without a translation entry fails here.
+   * asserted below, so adding a chain without a translation entry fails here.
+   *
+   * It has now done that once. `doge` and `etc` were added to `ChainId` and this case failed on the
+   * set assertion before either had a `CUSTODY_CHAIN` row — which is the whole of its value, and
+   * the reason the count is asserted rather than the pairs alone.
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   const expected: ReadonlyArray<readonly [ChainId, string]> = [
@@ -299,6 +303,12 @@ test('THE CHAIN ON THE WIRE IS CUSTODY NAME, NOT THIS SERVICE SLUG', async () =>
     ['btc', 'bitcoin'],
     ['sol', 'solana'],
     ['ltc', 'litecoin'],
+    ['doge', 'dogecoin'],
+    // The one that is not a lengthening. Custody's name is hyphenated because that is how the rest
+    // of the estate already spells it — the chain datadir and `pricing`'s CoinGecko id are both
+    // `ethereum-classic` — and `etc`, `ethereumclassic` and `ethereum_classic` would each be
+    // refused 400 `unknown_chain`, indistinguishably from a custody outage.
+    ['etc', 'ethereum-classic'],
   ]
   await withCustody(async (custody) => {
     for (const [slug, name] of expected) {
