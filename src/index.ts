@@ -27,7 +27,7 @@ import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
-import { indexerObservability } from './observability.ts'
+import { indexerObservability, payableChainsOnly, payableFromFeeQuotes } from './observability.ts'
 import {
   pendingCreditCount,
   sampleDepositAddressMetrics,
@@ -170,6 +170,23 @@ lifecycle
 //    lazily-connected surprise on the first request.
 const db = sql as unknown as Db
 
+/*
+ * Which chains this deployment will take a deposit on at all, before the indexer is asked.
+ *
+ * Logged once at boot rather than left to be discovered: the gate refuses with a 503 that names
+ * the asset and not the reason (`deposits.ts` explains why the person is not told), so without
+ * this line the only way to learn that `WALLET_FEE_QUOTES` is what shut the deposit route is to
+ * read the source. WARN and not INFO when it is empty, because a wallet that takes no deposits at
+ * all is almost always a variable somebody forgot rather than an intention.
+ */
+const payableOut = payableFromFeeQuotes(env.feeQuotes)
+logger[payableOut.chains.length === 0 ? 'warn' : 'info']('deposit gate', {
+  payableChains: payableOut.chains,
+  note:
+    'deposits are refused for every chain absent from this list, whatever the indexer follows, ' +
+    'because a withdrawal of its native asset could not be priced — WALLET_FEE_QUOTES',
+})
+
 const deposits: DepositDeps = {
   sql: db,
   producer: SERVICE,
@@ -177,10 +194,19 @@ const deposits: DepositDeps = {
   custody,
   indexer,
   ledger,
-  // Measured from the indexer per request (cached 60s), never asserted from a list here. See
-  // `observability.ts`: a second hardcoded list of supported chains is how the estate came to offer
-  // a real Bitcoin address that nothing was watching.
-  observability: indexerObservability({ indexer }),
+  // TWO gates, and they answer different questions. Can this estate SEE the chain — measured from
+  // the indexer per request (cached 60s), never asserted from a list here, because a second
+  // hardcoded list of supported chains is how the estate came to offer a real Bitcoin address that
+  // nothing was watching. And can it pay the chain's own coin back OUT — read from the withdrawal
+  // fee table, which is where an operator already states that (micro-org#373 §6.1).
+  //
+  // The payability gate is OUTERMOST on purpose: a chain this deployment cannot pay out on never
+  // reaches the indexer at all, so switching a chain on in `INDEXER_CHAINS` cannot open deposits
+  // as a side effect of a decision that was about something else.
+  observability: payableChainsOnly({
+    observability: indexerObservability({ indexer }),
+    payable: payableOut.payable,
+  }),
 }
 
 const withdrawals: WithdrawalDeps = {

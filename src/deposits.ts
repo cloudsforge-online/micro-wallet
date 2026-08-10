@@ -149,8 +149,11 @@ export interface DepositDeps {
   readonly indexer: IndexerClient
   readonly ledger: LedgerClient
   /**
-   * Whether this estate can SEE the chain an address would be on. See `observability.ts` — an
-   * address nothing watches is money that disappears with no error on either side.
+   * Whether this estate will take a deposit on the chain an address would be on. TWO questions,
+   * composed in `index.ts` and both answered from configuration rather than from a list here: can
+   * it SEE the chain (an address nothing watches is money that disappears with no error on either
+   * side) and can it SEND the chain's own coin back out (an address it can watch and cannot spend
+   * from is a balance nobody can withdraw — micro-org#373 §6.1). See `observability.ts`.
    */
   readonly observability: ChainObservability
 }
@@ -173,10 +176,11 @@ export interface AssignInput {
  * the asset and says the state is temporary, because from the person's side that is the whole of
  * what is true and actionable; which chains an indexer follows is not their problem to solve.
  *
- * `not_followed` and `unknown` are separated on the WIRE, not just in the log. They are different
- * facts — "this estate does not support that yet" versus "we could not confirm it right now" — and
- * a support conversation that cannot tell them apart is one where "try again later" is advice for
- * one of them and a lie for the other.
+ * `not_followed`, `not_retrievable` and `unknown` are separated on the WIRE, not just in the log.
+ * They are three different facts — "nothing here watches that chain", "we watch it and could not
+ * send anything back out of it", "we could not confirm either right now" — and a support
+ * conversation that cannot tell them apart is one where "try again later" is advice for the third
+ * and a lie for the other two.
  */
 async function assertObservable(
   deps: DepositDeps,
@@ -185,6 +189,21 @@ async function assertObservable(
 ): Promise<void> {
   const observation = await deps.observability.observe(chain, deps.network)
   if (observation.observable) return
+  if (observation.reason === 'not_retrievable') {
+    // Separate from `asset_not_observable` on the wire for the same reason those two are separate
+    // from each other: it is a different fact about the deployment. This estate can SEE the chain
+    // and has stated no way to send anything back out on it (micro-org#373 §6.1), so an address
+    // would be watched, and credited, and the balance would be one nobody could withdraw. The
+    // person is told the asset is unavailable and not why, deliberately — which chains a
+    // deployment can pay out on is an operational fact, and the log line carries it.
+    throw new DepositError(
+      'asset_not_withdrawable',
+      `${assetCode} deposits are not available on this deployment yet. This estate cannot send ` +
+        `${assetCode} back out, and it will not take a deposit it could not return — which is why ` +
+        'no address has been issued.',
+      503,
+    )
+  }
   if (observation.reason === 'unknown') {
     throw new DepositError(
       'observability_unknown',
@@ -436,7 +455,9 @@ async function watch(
  * itself would decide, or the two drift the moment a chain is added or a provider fails.
  *
  * So this asks the SAME `observability.observe` that `assertObservable` asks, per chain, and
- * reports the answer with its reason. `unavailable` is not a synonym for `unsupported`: the first
+ * reports the answer with its reason. Since micro-org#373 §6.1 that port is the composed gate, so
+ * a chain this deployment cannot pay out of is reported `not_retrievable` here and is never
+ * offered — which is the whole point of asking `assign` rather than describing what it does. `unavailable` is not a synonym for `unsupported`: the first
  * may be true for ten minutes, the second until someone deploys a node, and a person deciding
  * whether to wait deserves to know which.
  */
@@ -622,6 +643,17 @@ export async function sampleDepositAddressMetrics(
     metrics.set('wallet_chain_observability_unknown', observation.reason === 'unknown' ? 1 : 0, {
       chain,
     })
+    // The third condition, and it needs its own series for the same reason `unknown` does. Since
+    // micro-org#373 §6.1 the gate is `observable AND payable-out`, so a 0 above is now ALSO how a
+    // chain the indexer follows perfectly well reads when this deployment has stated no withdrawal
+    // fee for it — a deliberate refusal whose repair is a `WALLET_FEE_QUOTES` entry, not a node.
+    // Without this series an operator staring at `wallet_chain_observable{chain="btc"} 0` after
+    // switching the indexer on would go looking at the indexer, and find nothing wrong with it.
+    metrics.set(
+      'wallet_chain_not_retrievable',
+      observation.reason === 'not_retrievable' ? 1 : 0,
+      { chain },
+    )
   }
   // A chain in the table that this build does not know — the `deposit_address_assignments_chain_ck`
   // constraint makes it unreachable today, and it becomes reachable the moment a migration widens

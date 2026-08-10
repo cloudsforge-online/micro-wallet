@@ -52,7 +52,7 @@
  */
 
 import type { Network } from '@cloudsforge/contracts-chain'
-import type { ChainId } from './addresses.ts'
+import { assetOf, CHAIN_IDS, type ChainId } from './addresses.ts'
 import { IndexerUnavailableError, type IndexerClient } from './indexerclient.ts'
 
 /** Why a chain is not depositable. Distinct so a caller can answer differently. */
@@ -61,6 +61,12 @@ export type UnobservableReason =
   | 'not_followed'
   /** We could not ask, and have never had an answer to fall back on. */
   | 'unknown'
+  /**
+   * The estate can watch the chain but has stated no way to pay anything back out on it. See
+   * `payableChainsOnly` — an address we can see money arrive at and cannot send money from is a
+   * promise this deployment has not made.
+   */
+  | 'not_retrievable'
 
 export interface Observation {
   readonly observable: boolean
@@ -121,4 +127,82 @@ function decide(providers: number, stale: boolean): Observation {
   return providers > 0
     ? { observable: true, reason: null, providers, stale }
     : { observable: false, reason: 'not_followed', providers, stale }
+}
+
+/**
+ * **Watching a chain is not the same promise as being able to pay out on it, and this service used
+ * to make the second promise by accident whenever an operator made the first.**
+ *
+ * ── THE DEFECT, EXACTLY ───────────────────────────────────────────────────────────────────────
+ *
+ * Everything above decides on `providers > 0` and nothing else. So the single act of adding a
+ * scope to the indexer's `INDEXER_CHAINS` opened this service's deposit route for that chain, in
+ * the same instant, with no second decision anywhere. micro-org#373 §6.1 measured what that would
+ * mean for Bitcoin: `micro-settlement` has a complete BTC PSBT adapter that **cannot run against
+ * the estate's node** — it selects coins with `listunspent` and prices with `estimatesmartfee`,
+ * and bitcoind runs `disablewallet=1 blocksonly=1`, so both answer `-32601`/`-32603`. Turning the
+ * indexer on would have had this service handing out real Bitcoin addresses within one TTL, on a
+ * deployment where nothing could move a satoshi off one.
+ *
+ * The header above argues at length that a second hardcoded list of supported chains is the wrong
+ * repair, and that argument still holds and is not being reversed. This is not a list. It is the
+ * OTHER half of the same question, measured the same way — from the configuration that states it.
+ *
+ * ── WHY THE WITHDRAWAL FEE TABLE IS THE HONEST SIGNAL ─────────────────────────────────────────
+ *
+ * `WALLET_FEE_QUOTES` is already this estate's written statement of "we can pay this asset out":
+ * `settlement.ts`'s `staticFeeQuoter` throws for an asset absent from it and the withdrawal route
+ * refuses `fee_unavailable` with a 503, deliberately, rather than pricing by guessing. It is set
+ * per deployment by an operator, not by this repository, and micro-org#373 §6.3 independently
+ * concludes that BTC must not appear in it until a UTXO source and a fee source exist. So the two
+ * gates move together with no third variable to keep in step, and the ordering constraint that
+ * document spent a section deriving is enforced instead of documented.
+ *
+ * The NATIVE asset of the chain, via `assetOf`, not the asset being deposited: a fee is paid in
+ * the chain's own coin. An ERC-20 you cannot pay gas for is not withdrawable however many of it
+ * you hold — which is the same reason this is keyed on the chain and not on the token.
+ *
+ * ── WHAT IT COSTS, STATED PLAINLY ─────────────────────────────────────────────────────────────
+ *
+ * A deployment that has never set `WALLET_FEE_QUOTES` (it defaults to `{}`) now refuses every
+ * deposit, where before it accepted them. That IS the intended behaviour and not an oversight: on
+ * such a deployment every withdrawal already answers 503 `fee_unavailable`, so what it had was a
+ * wallet that took coins in and could not let them out. `index.ts` logs the open chains once at
+ * boot so the refusal is one grep away rather than a mystery on a support call.
+ *
+ * The indexer is deliberately NOT asked when this gate is shut. The answer cannot change the
+ * outcome, and not asking keeps an unconfigured chain off the indexer's request budget entirely.
+ */
+export interface PayableOptions {
+  readonly observability: ChainObservability
+  /** True when this deployment has stated a way to pay the chain's native asset out. */
+  readonly payable: (chain: ChainId) => boolean
+}
+
+export function payableChainsOnly(options: PayableOptions): ChainObservability {
+  return {
+    async observe(chain, network) {
+      if (!options.payable(chain)) {
+        return { observable: false, reason: 'not_retrievable', providers: 0, stale: false }
+      }
+      return options.observability.observe(chain, network)
+    },
+  }
+}
+
+/**
+ * The `payable` predicate built from the fee table, and the list it opens.
+ *
+ * Returns the list as well as the predicate because `index.ts` logs it at boot: a gate whose state
+ * is only visible by provoking a refusal is a gate nobody checks until a user complains.
+ */
+export function payableFromFeeQuotes(feeQuotes: Readonly<Record<string, bigint>>): {
+  readonly payable: (chain: ChainId) => boolean
+  readonly chains: readonly ChainId[]
+} {
+  const open = new Set<ChainId>(CHAIN_IDS.filter((chain) => feeQuotes[assetOf(chain)] !== undefined))
+  return {
+    payable: (chain) => open.has(chain),
+    chains: Object.freeze(CHAIN_IDS.filter((chain) => open.has(chain))),
+  }
 }
