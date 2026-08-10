@@ -674,6 +674,118 @@ export const MIGRATIONS: readonly Migration[] = [
         where ledger_entry_id is null;
     `,
   },
+
+  {
+    version: 15,
+    name: 'deposit_token_sightings',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * A TOKEN TRANSFER THAT ARRIVED AT A DEPOSIT ADDRESS AND WILL NOT BE CREDITED.
+     *
+     * micro-org#200. An ERC-20 transfer into a custodial deposit address was consumed and
+     * discarded — `token_deposit_unsupported`, no row anywhere, no notification, no number. The
+     * decision to refuse is right and this migration does not change it. What it changes is that
+     * the refusal now leaves EVIDENCE, so a user and an operator can both see money that arrived
+     * and is not spendable, instead of neither being able to.
+     *
+     * ── This is not a step towards crediting, and the shape says so ──────────────────────────
+     *
+     * There is no `ledger_entry_id`, no `credited_at`, no status column and nothing that could
+     * ever be flipped to "credited". Crediting a token needs a decimals value from a registry
+     * this service does not read, a `chain_assets` row only `micro-ledger` may write and a
+     * withdrawal path that does not exist; a column here that looked like a switch would invite
+     * exactly the change the issue exists to prevent. When crediting is built it will write
+     * `deposit_credits`, and these rows will stay as the record of the interval.
+     *
+     * ── Why the amount is stored at all, when nothing may act on it ──────────────────────────
+     *
+     * `numeric(78,0)`, in the token's own smallest units, and it is NOT a balance: it is one
+     * movement, like every other amount in this schema. It carries no decimals, because this
+     * service does not know them — `contracts-money.assetDecimals` throws for a `TOKEN:` code
+     * rather than guess 18, and a six-decimal stablecoin rendered at eighteen is wrong by 10^12.
+     * So the raw integer is stored and the API hands it out unscaled and says so. An unscaled
+     * integer a reader must interpret is honest; a formatted number nobody can justify is not.
+     *
+     * ── `token_asset_code`, not a symbol ─────────────────────────────────────────────────────
+     *
+     * `TOKEN:<chain>:<network>:<0x contract>`, built by `contracts-money.chainTokenAssetCode`,
+     * which throws on a brand name. A symbol read off a contract is mutable, spoofable and
+     * off-chain, and `USDT` as a code forces one exponent onto three deployments with two
+     * different ones. The contract address is the only name that cannot lie.
+     *
+     * ── NO `chain_ck` AND NO `network_ck`, AND THAT IS THE STRONGER OPTION, NOT THE LAZIER ONE ─
+     *
+     * The other five money tables each carry `check (chain in (…))`, and each one is a copy of the
+     * same list that a chain widening then has to remember to widen — `migrations.test.ts` asserts
+     * a widening touches all five precisely because forgetting one is silent until the first
+     * legitimate insert fails with a 23514, after custody has already minted a key.
+     *
+     * A sighting cannot exist without an assignment: it is written only when one is found for the
+     * exact address, and its `chain` and `network` are the values that lookup matched on. So the
+     * scope is not an independent fact to re-check — it is the parent's, and a copied CHECK here
+     * would be a sixth copy of a list, held in step by a test rather than by the database, that
+     * could disagree with the row it was copied from.
+     *
+     * The composite foreign key below says that instead, and says it in the only place that cannot
+     * drift: `(assignment_id, chain, network)` must be a row of `deposit_address_assignments`, so
+     * a sighting on a chain the assignment is not on is **unrepresentable** rather than merely
+     * checked, and a future chain is admitted here the moment it is admitted there with nothing to
+     * remember. It needs `(id, chain, network)` to be unique on the parent, which the ALTER below
+     * adds — `id` is already the primary key, so the constraint is free at write time and the index
+     * is the size of one row per address ever issued (243 on mainnet, 2026-08-10).
+     *
+     * `wallet_id` keeps its ordinary FK to `wallets`, as `deposit_credits` does.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      -- The parent key the composite reference below needs. Redundant as a uniqueness claim — id
+      -- is already the primary key — and that is the point: it costs nothing to guarantee and it
+      -- is what lets the child inherit the scope instead of restating it.
+      alter table deposit_address_assignments
+        drop constraint if exists deposit_address_assignments_id_scope_uniq;
+      alter table deposit_address_assignments
+        add constraint deposit_address_assignments_id_scope_uniq unique (id, chain, network);
+
+      create table if not exists deposit_token_sightings (
+        id               uuid        primary key,
+        user_id          uuid        not null,
+        assignment_id    uuid        not null,
+        wallet_id        uuid        not null references wallets (id),
+        -- Not independently constrained. See the header: the composite FK makes these the
+        -- assignment's own chain and network, which is a guarantee rather than a copied list.
+        chain            text        not null,
+        network          text        not null,
+        address_key      text        not null,
+        -- The contract the transfer was emitted by, lower-case hex.
+        token_address    text        not null,
+        -- TOKEN:<chain>:<network>:<contract>. See the header.
+        token_asset_code text        not null,
+        -- The token's own smallest units. Uninterpretable without decimals this service does not
+        -- have, and deliberately never scaled here.
+        amount           numeric(78,0) not null,
+        tx_hash          text        not null,
+        -- Never null: a token transfer is a log, and a movement with no log index is not one.
+        log_index        integer     not null,
+        block_height     bigint      not null,
+        confirmations    integer     not null,
+        -- Derived from (chain, network, tx_hash, log_index) exactly as \`credit_key\` is, so a
+        -- redelivery, a reorg re-emit and a second event describing one movement collapse to one
+        -- row whatever their event ids are.
+        sighting_key     text        not null,
+        first_seen_at    timestamptz not null default now(),
+        constraint deposit_token_sightings_amount_ck check (amount > 0),
+        constraint deposit_token_sightings_key_uniq unique (sighting_key),
+        constraint deposit_token_sightings_assignment_fk
+          foreign key (assignment_id, chain, network)
+          references deposit_address_assignments (id, chain, network)
+      );
+
+      -- The user's own read, newest first. Same shape as deposit_credits_user_idx because it
+      -- serves the same question asked of a different table.
+      create index if not exists deposit_token_sightings_user_idx
+        on deposit_token_sightings (user_id, id desc);
+    `,
+  },
 ]
 
 /**
@@ -700,6 +812,7 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, for the test suite's truncate and for the migrator's log. */
 export const TABLES: readonly string[] = Object.freeze([
+  'deposit_token_sightings',
   'deposit_credits',
   'deposit_address_assignments',
   'external_wallet_authorisations',

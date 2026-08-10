@@ -28,7 +28,12 @@ import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } fr
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
 import { indexerObservability } from './observability.ts'
-import { pendingCreditCount, sampleDepositAddressMetrics, type DepositDeps } from './deposits.ts'
+import {
+  pendingCreditCount,
+  sampleDepositAddressMetrics,
+  tokenSightingCount,
+  type DepositDeps,
+} from './deposits.ts'
 import type { MoneyDeps } from './money.ts'
 import type { PortfolioDeps } from './portfolio.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
@@ -233,6 +238,12 @@ const server = createServer({
     // after reading their count. The argument is on the function; `DepositCreditsUnposted` is the
     // rule that now reads this and cannot escalate on a saturating input.
     metrics.set('wallet_deposit_credits_pending', await pendingCreditCount(db))
+    // Customer money at a deposit address that no ledger entry accounts for — micro-org#200. Reads
+    // 0 on an estate that has never been sent a token, and once it is non-zero it stays non-zero,
+    // because nothing in this service can resolve a sighting. It is the size of an unrecorded
+    // obligation rather than a queue length, which is why it is worth a gauge before it is worth
+    // anything else.
+    metrics.set('wallet_deposit_token_sightings', await tokenSightingCount(db))
     // Per chain, from one query, on every replica — and the only writer of these three series.
     // The argument for all of that is on the function; the short version is that a leased job was
     // publishing a batch-capped copy of one of them from one replica.

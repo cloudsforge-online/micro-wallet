@@ -46,9 +46,17 @@ import {
   txUrn,
 } from '@cloudsforge/contracts-chain'
 import type { Actor } from '@cloudsforge/contracts-money'
+import { chainTokenAssetCode } from '@cloudsforge/contracts-money'
 import { ON_CHAIN_ASSETS } from '@cloudsforge/contracts-chain'
 import type { Metrics } from '@cloudsforge/telemetry'
-import { CHAIN_IDS, canonicaliseAddress, chainForAsset, type ChainId } from './addresses.ts'
+import {
+  CHAIN_IDS,
+  assetOf,
+  canonicaliseAddress,
+  chainForAsset,
+  isChainId,
+  type ChainId,
+} from './addresses.ts'
 import { uuidv7 } from './ids.ts'
 import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
@@ -57,6 +65,7 @@ import type { LedgerClient } from './ledgerclient.ts'
 import {
   DEPOSIT_ADDRESS_ASSIGNED,
   DEPOSIT_CREDITED,
+  DEPOSIT_TOKEN_UNCREDITED,
   withInbox,
   withOutbox,
   writeEvent,
@@ -781,7 +790,13 @@ async function claimCredit(
     // this service does not know and whose ledger asset code is `TOKEN:<urn>`, which needs the
     // mint's registry. Crediting it as the native asset would be off by a factor of 10^12 for a
     // six-decimal stablecoin.
-    return { kind: 'ignored', reason: 'token_deposit_unsupported' }
+    //
+    // **The refusal is unchanged. What changed is that it is now written down** — micro-org#200.
+    // This branch used to return here and nothing else happened: no row, no event, no number, and
+    // a user whose tokens had arrived at an address only micro-custody can sign for had no way to
+    // learn that they had. Recording the sighting credits nothing and posts nothing; see
+    // `recordTokenSighting`.
+    return recordTokenSighting(tx, deps, input)
   }
 
   const chain = payload.chain
@@ -844,6 +859,273 @@ async function claimCredit(
   if (inserted.length === 0) return { kind: 'duplicate', creditKey }
 
   return { kind: 'credited', creditId: id, creditKey }
+}
+
+/* --------------------------------------------------- token deposits, seen and not credited */
+
+/**
+ * The identity of one token sighting: `(chain, network, txHash, logIndex)`.
+ *
+ * Deliberately the same tuple `depositCreditKey` uses, with a different prefix. Same tuple because
+ * it is the same on-chain movement being identified and there is only one right answer to "is this
+ * the thing I already saw"; different prefix because a sighting and a credit are different
+ * decisions about it, and one namespace shared between them would let a future crediting path
+ * collide with the record of the interval before it existed.
+ */
+export function tokenSightingKey(
+  chain: string,
+  network: string,
+  txHash: string,
+  logIndex: number,
+): string {
+  return `wallet:token-sighting:${chain}:${network}:${txHash.toLowerCase()}:${logIndex}`
+}
+
+/**
+ * Record a token transfer that arrived at a deposit address, and tell the user — micro-org#200.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS FUNCTION CREDITS NOTHING, POSTS NOTHING AND MOVES NO MONEY, AND THAT IS THE DESIGN.**
+ *
+ * A credit needs the token's decimals, and this service has no source for them: `assetDecimals` in
+ * contracts-money throws for a `TOKEN:` code rather than return 18, because Tether is six decimals
+ * on Ethereum and eighteen on BSC and a wrong exponent on a stablecoin is a balance wrong by a
+ * factor of 10^12. It also needs a `chain_assets` row only `micro-ledger` may write, a `micro-
+ * pricing` route that answers for a `TOKEN:` urn — it answers `404 not_found` today — and a
+ * withdrawal path for tokens, which does not exist in any form. Crediting on an observation this
+ * estate cannot complete is the failure this whole path is built to refuse.
+ *
+ * What was wrong was never the refusal. It was that the refusal was SILENT: the event was
+ * consumed, `token_deposit_unsupported` was returned, and nothing anywhere held the fact that a
+ * user's tokens were sitting at an address only `micro-custody` can sign for. So this writes the
+ * evidence and emits the news, and the decision the caller returns is still "ignored".
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * ── Fail closed on attribution, not just on money ────────────────────────────────────────────
+ *
+ * Nothing is recorded unless an assignment for that exact address is on file, and then the row is
+ * filed against the user that assignment names. A sighting attributed to a guessed user is a
+ * message telling one person about another person's money, which is worse than the silence this
+ * replaces. `unknown_address` is the honest answer and it is already the answer the native path
+ * gives.
+ *
+ * ── The depth is re-checked against the CHAIN's native asset ─────────────────────────────────
+ *
+ * A token transfer is a log inside a block, so the block's depth is the token's depth: the exact
+ * number `requiredConfirmations(scope.chain)` the indexer used before it emitted. Re-derived here
+ * from the same exact-pinned `contracts-chain` for the same reason the native path re-derives it —
+ * the payload's `confirmations` is what the indexer computed from its tip at its moment, and this
+ * is where a stale one gets caught. It gates a message rather than money here, but a message
+ * saying tokens arrived, sent for a transaction a reorg then removed, is a message that cannot be
+ * taken back.
+ */
+async function recordTokenSighting(
+  tx: Tx,
+  deps: DepositDeps,
+  input: CreditInput,
+): Promise<CreditDecision> {
+  const payload = input.payload
+  // A chain this build has no address vocabulary for. `canonicaliseAddress` below would throw on
+  // it, and a throw rolls back the inbox row and redelivers for ever.
+  if (!isChainId(payload.chain)) return { kind: 'ignored', reason: 'unknown_chain' }
+  const chain: ChainId = payload.chain
+
+  // A token movement is a log. One without a log index cannot be identified against a second
+  // movement of the same token in the same transaction, so it is refused rather than merged.
+  if (payload.logIndex === null) return { kind: 'ignored', reason: 'token_deposit_without_log' }
+
+  const confirmations = payload.confirmations ?? 0
+  if (!isConfirmed(assetOf(chain), confirmations)) {
+    return { kind: 'ignored', reason: 'below_confirmation_depth' }
+  }
+
+  let amount: bigint
+  try {
+    amount = BigInt(payload.amount)
+  } catch {
+    return { kind: 'ignored', reason: 'unparseable_amount' }
+  }
+  if (amount <= 0n) return { kind: 'ignored', reason: 'non_positive_amount' }
+
+  // `TOKEN:<chain>:<network>:<0x contract>`, and it throws on anything else — including on a brand
+  // name, which is the promoted rule the issue turns on. A symbol read off the contract would be
+  // mutable, spoofable and off-chain; the deployment address is the only name that cannot lie.
+  let tokenAssetCode: string
+  try {
+    tokenAssetCode = chainTokenAssetCode({
+      chain,
+      network: deps.network,
+      contract: payload.tokenAddress ?? '',
+    })
+  } catch {
+    return { kind: 'ignored', reason: 'token_deposit_unidentified' }
+  }
+
+  const addressKey = canonicaliseAddress(chain, payload.address).key
+  // Every assignment ever made for this address, exactly as the credit path does: money at a
+  // rotated address is still the user's, and that is no less true of money that cannot be credited.
+  //
+  // **`asset_code` is deliberately NOT compared.** The credit path refuses a mismatch because it
+  // is about to post to a ledger account named by that code. Here the mismatch is the scenario
+  // itself — a token arriving at the address issued for the chain's native asset is precisely what
+  // micro-org#200 describes — and refusing on it would restore the silence.
+  const rows = await tx<AssignmentRow[]>`
+    select ${tx.unsafe(ASSIGNMENT_COLUMNS)} from deposit_address_assignments
+     where chain = ${chain} and network = ${payload.network} and address_key = ${addressKey}
+     order by assigned_at desc
+     limit 1
+  `
+  const assignment = rows[0]
+  if (!assignment) return { kind: 'ignored', reason: 'unknown_address' }
+
+  const sightingKey = tokenSightingKey(chain, payload.network, payload.txHash, payload.logIndex)
+  const id = uuidv7()
+  const inserted = await tx<{ id: string }[]>`
+    insert into deposit_token_sightings (
+      id, user_id, assignment_id, wallet_id, chain, network, address_key, token_address,
+      token_asset_code, amount, tx_hash, log_index, block_height, confirmations, sighting_key
+    )
+    values (
+      ${id}, ${assignment.user_id}, ${assignment.id}, ${assignment.wallet_id}, ${chain},
+      ${payload.network}, ${addressKey}, ${(payload.tokenAddress ?? '').toLowerCase()},
+      ${tokenAssetCode}, ${amount.toString()}::numeric(78,0), ${payload.txHash},
+      ${payload.logIndex}, ${payload.blockHeight}, ${confirmations}, ${sightingKey}
+    )
+    on conflict (sighting_key) do nothing
+    returning id
+  `
+  // Already on file. A reorg that put the transaction back at depth produces exactly this, and the
+  // user has already been told once — telling them again for one arrival is how a message that
+  // matters becomes one that gets ignored.
+  if (inserted.length === 0) return { kind: 'ignored', reason: 'token_deposit_duplicate' }
+
+  // **Written in the same transaction as the row it announces.** The credit path emits after its
+  // commit because a ledger call sits between the two and must not hold a transaction open; there
+  // is no such call here, so the strictly better ordering is available and is taken: the estate
+  // cannot end up with a sighting nobody was told about, or a message about a sighting that was
+  // rolled back.
+  await writeEvent(tx, deps.producer, {
+    topic: DEPOSIT_TOKEN_UNCREDITED,
+    key: assignment.wallet_id,
+    actor: `service:${deps.producer}`,
+    correlationId: input.correlationId,
+    payload: {
+      sightingId: id,
+      userId: assignment.user_id,
+      walletId: assignment.wallet_id,
+      chain,
+      network: payload.network,
+      tokenAddress: (payload.tokenAddress ?? '').toLowerCase(),
+      assetCode: tokenAssetCode,
+      // **Unscaled, and there is no `amountFormatted` beside it.** Every other money event in this
+      // service carries one; this one cannot, because formatting needs decimals nothing here is
+      // entitled to supply. A consumer that renders this must render the integer, or say nothing.
+      amount: amount.toString(),
+      txHash: payload.txHash,
+      txUrn: txUrn(assetOf(chain), payload.network as Network, payload.txHash),
+      explorerUrl: explorerTxUrl(assetOf(chain), payload.network as Network, payload.txHash),
+      confirmations,
+      // The one field a consumer must not have to infer. Everything downstream of this event is
+      // about a deposit that did NOT happen to the user's balance.
+      credited: false,
+    },
+  })
+
+  return { kind: 'ignored', reason: 'token_deposit_unsupported' }
+}
+
+export interface TokenSightingView {
+  readonly id: string
+  readonly assetCode: string
+  readonly tokenAddress: string
+  /** Smallest units of the token, UNSCALED — this service does not know its decimals. */
+  readonly amount: string
+  readonly chain: string
+  readonly network: string
+  readonly txHash: string
+  readonly txUrn: string
+  readonly explorerUrl: string | null
+  readonly confirmations: number
+  readonly firstSeenAt: string
+  /** Always false. Present so a reader cannot mistake this page for the credits page. */
+  readonly credited: false
+}
+
+interface SightingRow {
+  readonly id: string
+  readonly chain: string
+  readonly network: string
+  readonly token_address: string
+  readonly token_asset_code: string
+  readonly amount: string
+  readonly tx_hash: string
+  readonly confirmations: number
+  readonly first_seen_at: Date
+}
+
+/**
+ * A page of a user's uncredited token sightings, newest first. Keyset on `id`, which is UUIDv7.
+ *
+ * The twin of `listCredits`, and a SEPARATE route rather than rows mixed into that one. Mixing
+ * them would put "this is in your balance" and "this is not and cannot be withdrawn" in one list
+ * distinguished by a boolean, and the whole of micro-org#200 is that a user could not tell the
+ * difference. Two lists cannot be skim-read into one.
+ */
+export async function listTokenSightings(
+  sql: Db,
+  userId: string,
+  limit: number,
+  cursor: string | null,
+): Promise<{ sightings: readonly TokenSightingView[]; nextCursor: string | null }> {
+  const rows = await sql<SightingRow[]>`
+    select id, chain, network, token_address, token_asset_code, amount::text as amount, tx_hash,
+           confirmations, first_seen_at
+      from deposit_token_sightings
+     where user_id = ${userId}
+       and (${cursor}::uuid is null or id < ${cursor}::uuid)
+     order by id desc
+     limit ${limit + 1}
+  `
+  const page = rows.slice(0, limit)
+  return {
+    sightings: page.map((row) => {
+      const native = assetOf(row.chain as ChainId)
+      return {
+        id: row.id,
+        assetCode: row.token_asset_code,
+        tokenAddress: row.token_address,
+        // No `amountFormatted`. See the event payload above: a formatted figure here would be this
+        // service asserting a decimals value it has no source for.
+        amount: row.amount,
+        chain: row.chain,
+        network: row.network,
+        txHash: row.tx_hash,
+        // The transaction is on the chain whether or not the token is one this estate knows, so
+        // the explorer link is the chain's. It is the only thing on this page a user can act on.
+        txUrn: txUrn(native, row.network as Network, row.tx_hash),
+        explorerUrl: explorerTxUrl(native, row.network as Network, row.tx_hash),
+        confirmations: row.confirmations,
+        firstSeenAt: row.first_seen_at.toISOString(),
+        credited: false,
+      }
+    }),
+    nextCursor: rows.length > limit ? (page[page.length - 1]?.id ?? null) : null,
+  }
+}
+
+/**
+ * How many token deposits are sitting at deposit addresses, uncredited. The gauge's only source.
+ *
+ * A count and not a page, for the reason `pendingCreditCount` is: a gauge whose job is "how big is
+ * this" must not saturate at the size of a page. Unlike that one this number does not drain — a
+ * sighting is never resolved by this service — so it is a running total of an obligation nobody
+ * has recorded in the ledger, which is exactly the thing an operator should be able to alert on.
+ */
+export async function tokenSightingCount(sql: Db): Promise<number> {
+  const [row] = await sql<{ seen: string }[]>`
+    select count(*)::text as seen from deposit_token_sightings
+  `
+  return Number(row?.seen ?? 0)
 }
 
 interface CreditRow {
