@@ -14,7 +14,11 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { IndexerRefusedError, IndexerUnavailableError, type ChainStatus } from './indexerclient.ts'
-import { indexerObservability } from './observability.ts'
+import {
+  indexerObservability,
+  payableChainsOnly,
+  payableFromFeeQuotes,
+} from './observability.ts'
 
 function stub(options: {
   readonly providers?: number
@@ -167,5 +171,104 @@ describe('what this estate can actually see', () => {
     const gate = indexerObservability({ indexer, ttlMs: 60_000, now: () => 0 })
     assert.equal((await gate.observe('ember', 'mainnet')).observable, true)
     assert.equal((await gate.observe('ember', 'testnet')).observable, false)
+  })
+})
+
+/**
+ * **The other half of the same question, and the estate only ever asked one half.**
+ *
+ * micro-org#373 §6.1: everything above decides on `providers > 0`, so adding a scope to the
+ * indexer's `INDEXER_CHAINS` opened this service's deposit route in the same instant, with no
+ * second decision anywhere. For Bitcoin that would have meant handing out real addresses within
+ * one TTL on a deployment where `micro-settlement` cannot move a satoshi — its adapter needs
+ * `listunspent` and `estimatesmartfee`, and bitcoind runs `disablewallet=1 blocksonly=1`.
+ *
+ * The case that matters is the FIRST one: indexer says yes, gate still says no. A suite that only
+ * checked "no fee quote and no provider is refused" would pass against no gate at all.
+ */
+describe('a deposit is refused for a chain this estate cannot pay back out of', () => {
+  const following = (...chains: readonly string[]) => ({
+    chainStatus: async (chain: string, network: string): Promise<ChainStatus> => ({
+      chain: chain as ChainStatus['chain'],
+      network: network as ChainStatus['network'],
+      providers: chains.includes(chain) ? 1 : 0,
+      indexedHeight: null,
+      halted: false,
+    }),
+  })
+
+  it('refuses a chain the indexer follows PERFECTLY WELL when no fee is quoted for its coin', async () => {
+    const gate = payableChainsOnly({
+      observability: indexerObservability({ indexer: following('btc', 'ember') }),
+      payable: payableFromFeeQuotes({ EMBER: 21_000_000_000_000n }).payable,
+    })
+    const btc = await gate.observe('btc', 'mainnet')
+    assert.equal(btc.observable, false, 'BTC is indexed here and still must not be depositable')
+    assert.equal(btc.reason, 'not_retrievable')
+    // Distinct from `not_followed` on the wire, because the repair is a different one entirely:
+    // this is a WALLET_FEE_QUOTES entry, not a node.
+    assert.notEqual(btc.reason, 'not_followed')
+    assert.equal((await gate.observe('ember', 'mainnet')).observable, true)
+  })
+
+  it('does not ask the indexer at all about a chain it would refuse anyway', async () => {
+    const asked: string[] = []
+    const gate = payableChainsOnly({
+      observability: {
+        async observe(chain, network) {
+          asked.push(chain)
+          return { observable: true, reason: null, providers: 1, stale: false }
+        },
+      },
+      payable: payableFromFeeQuotes({ LTC: 10_000n }).payable,
+    })
+    assert.equal((await gate.observe('btc', 'mainnet')).observable, false)
+    assert.deepEqual(asked, [], 'a chain with no fee quote must not cost an indexer round trip')
+    assert.equal((await gate.observe('ltc', 'mainnet')).observable, true)
+    assert.deepEqual(asked, ['ltc'])
+  })
+
+  it('still refuses a payable chain the indexer does not follow — the gate is an AND', async () => {
+    const gate = payableChainsOnly({
+      observability: indexerObservability({ indexer: following('ember') }),
+      payable: payableFromFeeQuotes({ EMBER: 1n, LTC: 10_000n }).payable,
+    })
+    const ltc = await gate.observe('ltc', 'mainnet')
+    assert.equal(ltc.observable, false)
+    assert.equal(ltc.reason, 'not_followed')
+  })
+
+  /*
+   * The fee is paid in the chain's OWN coin, so the table is read at the native asset of the chain
+   * and never at the asset being deposited. Keyed the other way, a deployment quoting a fee for
+   * some token would have opened its whole chain.
+   */
+  it('reads the fee table at the chain native asset, and the mainnet table opens exactly two chains', () => {
+    const { chains, payable } = payableFromFeeQuotes({ EMBER: 21_000_000_000_000n, LTC: 10_000n })
+    assert.deepEqual([...chains], ['ember', 'ltc'], 'the live mainnet WALLET_FEE_QUOTES, verbatim')
+    assert.equal(payable('ember'), true)
+    assert.equal(payable('ltc'), true)
+    assert.equal(payable('btc'), false)
+    assert.equal(payable('doge'), false)
+  })
+
+  /*
+   * `WALLET_FEE_QUOTES` defaults to `{}`, and on such a deployment every withdrawal already answers
+   * 503 `fee_unavailable`. Closing deposits there is the intended consequence and not an oversight:
+   * what it had was a wallet that took coins in and could not let them out. Asserted so that a
+   * later "surely this should default open" is a red test rather than a quiet reversal.
+   */
+  it('takes nothing in when the deployment has stated no way to pay anything out', async () => {
+    const { chains, payable } = payableFromFeeQuotes({})
+    assert.deepEqual([...chains], [])
+    const gate = payableChainsOnly({
+      observability: indexerObservability({ indexer: following('ember', 'btc', 'ltc') }),
+      payable,
+    })
+    for (const chain of ['ember', 'btc', 'ltc'] as const) {
+      const answer = await gate.observe(chain, 'mainnet')
+      assert.equal(answer.observable, false, `${chain} must be refused`)
+      assert.equal(answer.reason, 'not_retrievable')
+    }
   })
 })

@@ -13,8 +13,10 @@ import {
   postCredit,
   tokenSightingCount,
   unwatchedAssignments,
+  type DepositDeps,
 } from './deposits.ts'
 import { INDEXER_DEPOSIT_CONFIRMED } from './outbox.ts'
+import { payableChainsOnly, payableFromFeeQuotes } from './observability.ts'
 import {
   depositPayload,
   enabled,
@@ -161,6 +163,53 @@ test('refuses a deposit address for a chain this estate cannot observe', { skip 
   assert.equal(h.custody.minted.length, 0)
   const rows = await sql`select count(*)::int as n from deposit_address_assignments`
   assert.equal(rows[0]!.n, 0)
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE SECOND HALF OF THE SAME QUESTION — micro-org#373 §6.1
+ *
+ * The refusal above is about what this estate can SEE. This one is about what it can SEND, and
+ * until now nothing asked. `observability.ts` decided on `providers > 0` alone, so the single act
+ * of adding a scope to the indexer's `INDEXER_CHAINS` opened this route for that chain within one
+ * cache TTL, with no second decision anywhere.
+ *
+ * Measured, for Bitcoin, in micro-org#373: `micro-settlement` has a complete BTC PSBT adapter that
+ * cannot run against this estate's node — it selects coins with `listunspent` and prices with
+ * `estimatesmartfee`, and bitcoind runs `disablewallet=1 blocksonly=1`, so both answer -32601 and
+ * -32603. An address issued in that state is watched, and credited, and produces a balance that
+ * nobody in the estate can pay out.
+ *
+ * The wire code is its own (`asset_not_withdrawable`, not `asset_not_observable`) because the two
+ * have different repairs — one is a node, the other is a `WALLET_FEE_QUOTES` entry — and a support
+ * conversation that cannot tell them apart gives the wrong advice for one of them.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('refuses a chain the indexer follows but this estate cannot pay out of', { skip }, async () => {
+  // The indexer follows BTC completely. This is the case a weaker test would miss: with the gate
+  // removed, everything below passes.
+  h.indexer.setProviders('btc', 'testnet', 1)
+  const gated: DepositDeps = {
+    ...h.deposits,
+    observability: payableChainsOnly({
+      observability: h.deposits.observability,
+      // What the live mainnet WALLET_FEE_QUOTES states today: EMBER and LTC, no BTC.
+      payable: payableFromFeeQuotes({ EMBER: 21_000_000_000_000n, LTC: 10_000n }).payable,
+    }),
+  }
+  await assert.rejects(
+    () => assignDepositAddress(gated, { userId: USER, assetCode: 'BTC', correlationId: 'r' }),
+    (err: unknown) =>
+      err instanceof Error &&
+      /cannot send BTC back out/.test(err.message) &&
+      /will not take a deposit it could not return/.test(err.message),
+  )
+  assert.equal(h.custody.minted.length, 0, 'a refusal must not burn a custody key')
+  const rows = await sql`select count(*)::int as n from deposit_address_assignments`
+  assert.equal(rows[0]!.n, 0)
+  // And the ungated deps still issue one, so what changed is the gate and not the chain.
+  const issued = await assignDepositAddress(h.deposits, { userId: USER, assetCode: 'BTC', correlationId: 'r' })
+  assert.equal(issued.chain, 'btc')
 })
 
 test('opens the moment the indexer reports a provider, with no code change', { skip }, async () => {
