@@ -67,6 +67,7 @@ import {
   handleDepositConfirmed,
   listAssignments,
   listCredits,
+  listTokenSightings,
   type DepositDeps,
   type DepositEventPayload,
 } from './deposits.ts'
@@ -191,6 +192,28 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     .register({
       name: 'wallet_deposit_credits_pending',
       help: 'Deposit credits claimed locally whose ledger posting has not landed. Should be 0.',
+      kind: 'gauge',
+      labels: [],
+    })
+    /**
+     * **Money that arrived at a deposit address and is in nobody's ledger** — micro-org#200.
+     *
+     * Unlike `wallet_deposit_credits_pending`, which is a backlog that drains, this one only ever
+     * goes up: a token sighting is never resolved by this service, because crediting a `TOKEN:`
+     * asset needs a decimals source, a `chain_assets` row and a withdrawal path none of which
+     * exist. So it is not an error rate — it is the size of an obligation the estate has taken on
+     * and has not recorded, and the number an operator needs before deciding whether the token
+     * work is still ahead of the queue.
+     *
+     * Unlabelled for the same reason the pending-credits gauge is: every row has the same repair,
+     * which is a human one, and the chain, contract and user are in the row rather than in a label
+     * Prometheus would carry for ever.
+     */
+    .register({
+      name: 'wallet_deposit_token_sightings',
+      help:
+        'Token transfers observed at deposit addresses and not credited. Never drains — see ' +
+        'micro-org#200. Non-zero means customer money is held against no ledger liability.',
       kind: 'gauge',
       labels: [],
     })
@@ -792,6 +815,27 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps, READ_SCOPE)
       const userId = actingUser(ctx, principal)
       const page = await listCredits(
+        deps.portfolio.sql,
+        userId,
+        limitFrom(ctx),
+        ctx.url.searchParams.get('cursor'),
+      )
+      return { status: 200, body: page }
+    }),
+
+    /**
+     * Token transfers that arrived at this user's deposit addresses and were **not credited**.
+     *
+     * micro-org#200. A separate route from `/v1/deposits/credits` on purpose: those rows are money
+     * in the user's balance and these are money that is not, and the two must not arrive in one
+     * list to be told apart by a flag. Every row here says `credited: false` and carries no
+     * formatted amount, because the token's decimals are not something this service has a source
+     * for — see `listTokenSightings`.
+     */
+    route('GET', '/v1/deposits/token-sightings', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, READ_SCOPE)
+      const userId = actingUser(ctx, principal)
+      const page = await listTokenSightings(
         deps.portfolio.sql,
         userId,
         limitFrom(ctx),

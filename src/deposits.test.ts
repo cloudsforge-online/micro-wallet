@@ -8,8 +8,10 @@ import {
   depositCreditKey,
   handleDepositConfirmed,
   listCredits,
+  listTokenSightings,
   pendingCredits,
   postCredit,
+  tokenSightingCount,
   unwatchedAssignments,
 } from './deposits.ts'
 import { INDEXER_DEPOSIT_CONFIRMED } from './outbox.ts'
@@ -30,6 +32,26 @@ let h: Harness
 
 const USER = testUser(1)
 const OTHER = testUser(2)
+
+/**
+ * A real contract address shape — Tether's on Ethereum mainnet, which is the deployment
+ * micro-org#200 is written about and the one `foresight` already registers with six decimals.
+ *
+ * Used as a literal rather than a symbol because the address is the ONLY name for a token this
+ * estate will accept: `USDT` is one brand across three deployments with two different decimals,
+ * and `contracts-money.chainTokenAssetCode` throws on it.
+ */
+const TOKEN = '0xdac17f958d2ee523a2206206994597c13d831ec7'
+
+/** The overrides that turn `depositPayload` into an ERC-20 transfer of that token. */
+const tokenTransfer = (overrides: Record<string, unknown> = {}) => ({
+  assetKind: 'token',
+  tokenAddress: TOKEN,
+  assetCode: TOKEN,
+  logIndex: 4,
+  amount: '250000000',
+  ...overrides,
+})
 
 before(async () => {
   if (!enabled) return
@@ -307,7 +329,15 @@ test('every refusal is a stated reason rather than a silent drop', { skip }, asy
   const cases: Array<[Record<string, unknown>, string]> = [
     [{ direction: 'out' }, 'outbound_movement'],
     [{ network: 'mainnet' }, 'wrong_network'],
-    [{ assetKind: 'token', tokenAddress: '0xabc' }, 'token_deposit_unsupported'],
+    // Still refused, and still by that name. micro-org#200 changed what the refusal LEAVES BEHIND
+    // — a row and an event — not the decision, and this case is here to keep that true.
+    [{ assetKind: 'token', tokenAddress: TOKEN, logIndex: 7 }, 'token_deposit_unsupported'],
+    // A contract address that is not one. `chainTokenAssetCode` throws rather than normalise, so
+    // nothing is filed under a code two spellings of one deployment could share.
+    [{ assetKind: 'token', tokenAddress: '0xabc', logIndex: 8 }, 'token_deposit_unidentified'],
+    // A token movement with no log index cannot be told apart from a second movement of the same
+    // token in the same transaction, so it is refused rather than merged into one row.
+    [{ assetKind: 'token', tokenAddress: TOKEN, logIndex: null }, 'token_deposit_without_log'],
     // Below EMBER's published depth of 60. **Re-checked here against contracts-chain rather than
     // trusted from the payload** — this is the one input that could credit money too early.
     [{ confirmations: 59 }, 'below_confirmation_depth'],
@@ -325,6 +355,116 @@ test('every refusal is a stated reason rather than a silent drop', { skip }, asy
     assert.deepEqual(decision, { kind: 'ignored', reason }, `wrong reason for ${JSON.stringify(overrides)}`)
   }
   assert.equal(h.ledger.entries.length, 0)
+})
+
+/* ------------------------------------------------------ token deposits: seen, never credited */
+
+test('a token transfer to a deposit address is recorded and announced, and credits nothing', { skip }, async () => {
+  // micro-org#200's whole scenario: the user has an address for the chain's native asset, sends a
+  // token to it, and — before this — learned nothing, ever, from anybody.
+  const { address, assignmentId } = await assigned()
+  const decision = await deliver('11111111-0000-4000-8000-000000000001', {
+    address,
+    ...tokenTransfer(),
+  })
+
+  // The decision is unchanged and must stay unchanged. Crediting would need decimals this service
+  // has no source for; `assetDecimals` throws for a TOKEN: code rather than assume 18.
+  assert.deepEqual(decision, { kind: 'ignored', reason: 'token_deposit_unsupported' })
+  assert.equal(h.ledger.entries.length, 0, 'nothing may be posted to the ledger')
+  assert.equal((await sql`select 1 from deposit_credits`).length, 0, 'and nothing credited')
+
+  const rows = await sql<
+    { user_id: string; assignment_id: string; token_asset_code: string; amount: string }[]
+  >`select user_id, assignment_id, token_asset_code, amount::text as amount
+      from deposit_token_sightings`
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.user_id, USER)
+  assert.equal(rows[0]?.assignment_id, assignmentId)
+  // The deployment, not the brand. This is the spelling the rule in contracts-money enforces.
+  assert.equal(rows[0]?.token_asset_code, `TOKEN:ember:testnet:${TOKEN}`)
+  // Smallest units of the token, stored exactly as they arrived. 250000000 is 250 USDT at six
+  // decimals and 0.00000000025 at eighteen, and this service is not entitled to say which.
+  assert.equal(rows[0]?.amount, '250000000')
+
+  const events = await sql<{ topic: string; key: string; payload: Record<string, unknown> }[]>`
+    select topic, key, payload from outbox where topic = 'wallet.deposit.token_uncredited'
+  `
+  assert.equal(events.length, 1, 'exactly one announcement')
+  assert.equal(events[0]?.payload['userId'], USER)
+  assert.equal(events[0]?.payload['credited'], false)
+  assert.equal(events[0]?.payload['amount'], '250000000')
+  // No formatted amount anywhere in the payload — the decimals do not exist to produce one.
+  assert.equal(events[0]?.payload['amountFormatted'], undefined)
+})
+
+test('a redelivered token transfer is recorded once and announced once', { skip }, async () => {
+  // Delivery is at-least-once and a reorg re-emits at depth, so this is normal operation. A second
+  // message for one arrival is how a message that matters becomes one the user learns to ignore.
+  const { address } = await assigned()
+  const first = await deliver('22222222-0000-4000-8000-000000000001', {
+    address,
+    ...tokenTransfer(),
+  })
+  const second = await deliver('22222222-0000-4000-8000-000000000002', {
+    address,
+    ...tokenTransfer(),
+  })
+
+  assert.deepEqual(first, { kind: 'ignored', reason: 'token_deposit_unsupported' })
+  assert.deepEqual(second, { kind: 'ignored', reason: 'token_deposit_duplicate' })
+  assert.equal((await sql`select 1 from deposit_token_sightings`).length, 1)
+  assert.equal(
+    (await sql`select 1 from outbox where topic = 'wallet.deposit.token_uncredited'`).length,
+    1,
+  )
+})
+
+test('a token transfer to an address nobody was assigned tells nobody', { skip }, async () => {
+  // Fail closed on ATTRIBUTION, not only on money. A sighting filed against a guessed user is a
+  // message about somebody else's funds, which is worse than the silence this change removes.
+  await assigned()
+  const decision = await deliver('33333333-0000-4000-8000-000000000001', {
+    address: '0x000000000000000000000000000000000000dead',
+    ...tokenTransfer(),
+  })
+  assert.deepEqual(decision, { kind: 'ignored', reason: 'unknown_address' })
+  assert.equal((await sql`select 1 from deposit_token_sightings`).length, 0)
+  assert.equal(
+    (await sql`select 1 from outbox where topic = 'wallet.deposit.token_uncredited'`).length,
+    0,
+  )
+})
+
+test('the user can read the token deposits that were not credited', { skip }, async () => {
+  const { address } = await assigned()
+  await deliver('44444444-0000-4000-8000-000000000001', { address, ...tokenTransfer() })
+
+  const page = await listTokenSightings(sql, USER, 20, null)
+  assert.equal(page.sightings.length, 1)
+  const [sighting] = page.sightings
+  assert.equal(sighting?.credited, false)
+  assert.equal(sighting?.assetCode, `TOKEN:ember:testnet:${TOKEN}`)
+  assert.equal(sighting?.tokenAddress, TOKEN)
+  // Unscaled, and the type has no field that could carry a scaled one.
+  assert.equal(sighting?.amount, '250000000')
+  // The transaction is on the chain whether or not the token is known, so the one thing on this
+  // page a user can act on is a link to it.
+  assert.equal(sighting?.txUrn.length > 0, true)
+
+  // And another user's account shows nothing of it.
+  assert.equal((await listTokenSightings(sql, OTHER, 20, null)).sightings.length, 0)
+})
+
+test('the uncredited-token gauge counts rows, not a page', { skip }, async () => {
+  const { address } = await assigned()
+  assert.equal(await tokenSightingCount(sql), 0)
+  await deliver('55555555-0000-4000-8000-000000000001', { address, ...tokenTransfer() })
+  await deliver('55555555-0000-4000-8000-000000000002', {
+    address,
+    ...tokenTransfer({ logIndex: 9 }),
+  })
+  assert.equal(await tokenSightingCount(sql), 2)
 })
 
 test('a deposit at exactly the published depth is credited', { skip }, async () => {

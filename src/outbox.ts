@@ -73,6 +73,30 @@ export const DEPOSIT_ADDRESS_ASSIGNED = 'wallet.deposit_address.assigned'
  * this emit already used — `keyedBy: 'wallet_id'`, deposits.ts.
  */
 export const DEPOSIT_CREDITED = 'wallet.deposit.confirmed'
+/**
+ * A token transfer arrived at a deposit address and **was not credited** — micro-org#200.
+ *
+ * The exact opposite fact to `DEPOSIT_CREDITED`, and it needs its own topic for that reason: a
+ * consumer that saw only one deposit topic would have to read a field to know whether the news is
+ * "your money is spendable" or "your money is here and is not". Two topics make the wrong reading
+ * unavailable rather than merely discouraged.
+ *
+ * **Registered in `contracts-events` before this landed, and that ordering was not optional.**
+ * `validateEnvelope` refuses an unregistered name and `createRelay` below quarantines on exactly
+ * that verdict rather than delivering — measured on 2026-08-10 against the registry as it then
+ * stood, `topic: "wallet.deposit.token_uncredited" is not in this registry; contracts-events may
+ * be behind`. An emit added first would have written rows nothing could publish and no user could
+ * be told about, which is a quieter version of the silence micro-org#200 is about. micro-contracts
+ * #5 registered the topic; micro-notify holds the rule that turns it into the user's mail.
+ *
+ * The payload carries `userId` explicitly rather than leaving `notify` to derive it. That service
+ * falls back to the envelope key only for topics the registry declares `keyed_by: user_id`, and
+ * this one is keyed by `wallet_id` — as `wallet.deposit.confirmed` is, so the two opposite deposit
+ * facts for one wallet stay ordered against each other instead of racing. Attributing a wallet id
+ * to a user is the one mistake a notification service must never make, so the id it needs is sent
+ * rather than inferred.
+ */
+export const DEPOSIT_TOKEN_UNCREDITED = 'wallet.deposit.token_uncredited'
 export const WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
 export const WITHDRAWAL_REFUNDED = 'wallet.withdrawal.refunded'
 export const WITHDRAWAL_STUCK = 'wallet.withdrawal.stuck'
