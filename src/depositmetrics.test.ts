@@ -1,5 +1,5 @@
 /**
- * What a scrape says about the deposit-address backlog.
+ * What a scrape says about the two deposit backlogs.
  *
  * These are separated from `deposits.test.ts` because they are not about crediting; they are about
  * the one thing micro-org#310 is: whether a number the estate alerts on means what the alert
@@ -9,6 +9,14 @@
  * condition it *described* is forge-pay's, and `deposits.ts`'s header records why it cannot happen
  * here. What remains is the backlog these tests are about, and it was being measured badly enough
  * that no honest rule could have been written on it either.
+ *
+ * The file covers TWO backlogs now, because micro-org#326 found the identical pair of defects on
+ * the credit-posting side: `wallet_deposit_credits_pending` was the `.length` of a 500-row page, so
+ * it saturated, and the leased retry job wrote its own 50-row cap over the same series name. An
+ * address nobody registered is money nobody will be told about; a credit nobody posted is money the
+ * owner cannot see. Same failure, opposite ends of the deposit path, same two measurement bugs — so
+ * the tests that pin one belong beside the tests that pin the other, or the next gauge is fixed one
+ * at a time again.
  */
 
 import { test, before, after, beforeEach } from 'node:test'
@@ -18,6 +26,8 @@ import { Metrics } from '@cloudsforge/telemetry'
 import { CHAIN_IDS } from './addresses.ts'
 import {
   assignDepositAddress,
+  pendingCreditCount,
+  pendingCredits,
   sampleDepositAddressMetrics,
   unwatchedAssignments,
   unwatchedByChain,
@@ -25,7 +35,7 @@ import {
 import { IndexerUnavailableError } from './indexerclient.ts'
 import { indexerObservability } from './observability.ts'
 import { registerServiceMetrics } from './server.ts'
-import { WATCH_KIND, registerHandlers } from './jobs.ts'
+import { POST_CREDIT_KIND, WATCH_KIND, registerHandlers } from './jobs.ts'
 import type { JobRunner } from '@cloudsforge/jobs'
 import {
   enabled,
@@ -216,16 +226,16 @@ test('“the indexer follows no source” and “we could not ask” are two ser
 
 /* --------------------------------------------------------------- the writer */
 
-test('the watch job does not publish the backlog gauges', { skip }, async () => {
-  // It saw one batch of at most 50 and it is leased to one replica, so what it published was
-  // `min(backlog, 50)` on one scrape target out of N. Two writers of one series name, disagreeing
-  // about the definition of the number, is how one fact came to have several values in the estate.
-  await unwatched('LTC', testUser(1))
-
+/**
+ * Run one pass of a job handler against the real `registerHandlers`, and report which series it
+ * published. Shared by the two tests below because they are one assertion made twice: a leased job
+ * that writes a batch-capped copy of a backlog gauge is the defect, whichever gauge it is.
+ */
+async function publishedByJob(kind: string): Promise<readonly string[]> {
   const handlers = new Map<string, (job: never, ctx: never) => Promise<void>>()
   const runner = {
-    register(kind: string, handler: (job: never, ctx: never) => Promise<void>) {
-      handlers.set(kind, handler)
+    register(k: string, handler: (job: never, ctx: never) => Promise<void>) {
+      handlers.set(k, handler)
       return this
     },
   } as unknown as JobRunner
@@ -240,7 +250,7 @@ test('the watch job does not publish the backlog gauges', { skip }, async () => 
     withdrawals: h.withdrawals,
   })
 
-  await handlers.get(WATCH_KIND)!({} as never, {
+  await handlers.get(kind)!({} as never, {
     signal: new AbortController().signal,
     heartbeat: async () => true,
   } as never)
@@ -249,7 +259,7 @@ test('the watch job does not publish the backlog gauges', { skip }, async () => 
   // the very code this is about: the old writer passed no labels, so it published the name with an
   // empty label set — a second, unlabelled series beside the per-chain ones, which is worse than
   // either alone. `# HELP`/`# TYPE` are excluded because a registration is not a reading.
-  const published = metrics
+  return metrics
     .render()
     .split('\n')
     .filter((line) => line.length > 0 && !line.startsWith('#'))
@@ -257,6 +267,75 @@ test('the watch job does not publish the backlog gauges', { skip }, async () => 
       const brace = line.indexOf('{')
       return line.slice(0, brace === -1 ? line.indexOf(' ') : brace)
     })
+}
+
+test('the watch job does not publish the backlog gauges', { skip }, async () => {
+  // It saw one batch of at most 50 and it is leased to one replica, so what it published was
+  // `min(backlog, 50)` on one scrape target out of N. Two writers of one series name, disagreeing
+  // about the definition of the number, is how one fact came to have several values in the estate.
+  await unwatched('LTC', testUser(1))
+
+  const published = await publishedByJob(WATCH_KIND)
   assert.equal(published.includes('wallet_deposit_addresses_unwatched'), false)
   assert.equal(published.includes('wallet_deposit_addresses_unobservable'), false)
+})
+
+/* --------------------------------------------------------------- the credit-posting backlog */
+
+/**
+ * `count` credits that were claimed and never posted, inserted directly.
+ *
+ * Directly, because the point is the NUMBER: driving six hundred credits through
+ * `handleDepositConfirmed` against a ledger rigged to fail would be six hundred round trips for no
+ * extra proof, and `deposits.test.ts` already pins that the claim-then-post ordering leaves exactly
+ * this row behind. `ledger_entry_id` is left null, which is the entire definition of the backlog —
+ * money on the chain, claimed by this service, and invisible to its owner.
+ */
+async function unposted(count: number, userId: string): Promise<void> {
+  const seed = await assignDepositAddress(h.deposits, {
+    userId,
+    assetCode: 'EMBER',
+    correlationId: 'req-credit',
+  })
+  await sql`
+    insert into deposit_credits
+      (id, user_id, assignment_id, wallet_id, chain, network, address_key, asset_code,
+       amount, tx_hash, block_height, confirmations, credit_key)
+    select gen_random_uuid(), ${userId}::uuid, a.id, a.wallet_id, a.chain, a.network,
+           a.address_key, a.asset_code, 1000, '0xtest' || n::text, 100 + n, 12,
+           'test:credit:' || n::text
+      from generate_series(1, ${count}) as n
+     cross join (select id, wallet_id, chain, network, address_key, asset_code
+                   from deposit_address_assignments where id = ${seed.id}) as a
+  `
+}
+
+test('the pending-credit reading is a count, not the length of a page', { skip }, async () => {
+  await unposted(600, testUser(1))
+
+  assert.equal(await pendingCreditCount(h.deposits.sql), 600)
+  // What the scrape used to publish. `min(backlog, 500)` reports the same number for five hundred
+  // unposted credits and for fifty thousand, so `DepositCreditsUnposted` fires identically on a
+  // backlog that is draining and on one that is running away — and the graph an operator checks
+  // next goes flat at exactly the moment it should be going vertical.
+  assert.equal((await pendingCredits(h.deposits.sql, 500)).length, 500)
+})
+
+test('an empty backlog is a measured zero, not an absent series', { skip }, async () => {
+  // The healthy reading has to be a real 0 rather than nothing: `DepositCreditsUnposted` is
+  // `> 0`, and an absent series and a healthy one are the same shape to that rule. This is also
+  // the case the index exists for — no matching row means nothing to stop early on.
+  assert.equal(await pendingCreditCount(h.deposits.sql), 0)
+})
+
+test('the post-credit job does not publish the pending gauge', { skip }, async () => {
+  // It wrote `pending.length`, capped at `BATCH` — 50, a TIGHTER cap than the 500 `beforeScrape`
+  // applied to the same series name — from the one replica holding the lease. It was invisible only
+  // because the next scrape re-sampled over it, which makes it a write that can never be read
+  // rather than a write that is correct. Left in place it is the second writer that turned the
+  // address gauge into one fact with several values.
+  await unposted(3, testUser(1))
+
+  const published = await publishedByJob(POST_CREDIT_KIND)
+  assert.equal(published.includes('wallet_deposit_credits_pending'), false)
 })

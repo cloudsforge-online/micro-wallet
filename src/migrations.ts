@@ -631,6 +631,49 @@ export const MIGRATIONS: readonly Migration[] = [
       alter table wallets add column if not exists status_reason text;
     `,
   },
+
+  {
+    version: 14,
+    name: 'deposit_credits_unposted_idx',
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * THE ACCESS PATH FOR "HOW MUCH MONEY ARRIVED AND WAS NEVER POSTED".
+     *
+     * `deposit_credits` has three indexes and not one of them serves `ledger_entry_id is null`.
+     * That predicate has two readers and both run on a schedule: `pendingCredits`, which is the
+     * `deposit.post-credit` retry job's entire input, and `pendingCreditCount`, which micro-org#326
+     * makes the sole source of `wallet_deposit_credits_pending` on every scrape on every replica.
+     *
+     * Without this index the count is a sequential scan of every deposit this service has ever
+     * credited, and the HEALTHY estate pays the most for it: with nothing pending there is no
+     * matching row to stop early on, so a clean table is scanned in full every time. Measured on
+     * postgres 17 on 2026-08-10, 200,000 credited rows and none pending — the shape a working
+     * estate has — `select count(*) … where ledger_entry_id is null` touched **2,062 buffers as a
+     * sequential scan and 1 buffer as an index-only scan** with this index present, and the retry
+     * job's `order by id limit 50` went from a sort over the whole filtered set to the same single
+     * buffer.
+     *
+     * That cost is invisible today: mainnet's `deposit_credits` held 1 row on 2026-08-10, 0 of them
+     * unposted. It grows with credited history for ever, which is the shape of a defect only
+     * discovered once the table is too big to index quietly. `withdrawals_open_idx` in migration 9
+     * is the same decision on the withdrawals table, taken before that table had rows either.
+     *
+     * Keyed on `id` rather than being a bare predicate index, so it serves `pendingCredits` too:
+     * that query is `order by id limit $1`, which reads straight off this index in order instead of
+     * walking the primary key and filtering. Partial, so it holds only the backlog — in a healthy
+     * service that is an empty index, which costs nothing to maintain and nothing to scan.
+     *
+     * No `network` predicate, deliberately, because neither reader has one. `pendingCredits` will
+     * pick up and try to post a row on any network, so an index that excluded some of them would
+     * serve a narrower question than the one being asked.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      create index if not exists deposit_credits_unposted_idx
+        on deposit_credits (id)
+        where ledger_entry_id is null;
+    `,
+  },
 ]
 
 /**

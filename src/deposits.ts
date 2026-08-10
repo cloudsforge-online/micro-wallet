@@ -980,6 +980,47 @@ export async function pendingCredits(sql: Db, limit: number): Promise<readonly s
   return rows.map((row) => row.id)
 }
 
+/**
+ * How much money has arrived and not been posted. The gauge's only source.
+ *
+ * **A count, not the length of a page** — which is the defect `unwatchedByChain` above was written
+ * to remove on the address backlog, and the credits gauge was not carried along with it.
+ * `beforeScrape` published `(await pendingCredits(db, 500)).length`, so
+ * `wallet_deposit_credits_pending` was `min(backlog, 500)`: five hundred unposted credits and forty
+ * thousand publish the same number, and the series goes FLAT at the exact moment it should be going
+ * vertical. A flat line reads as "stable" to somebody who has thirty seconds to decide whether this
+ * is the thing that woke them, and a gauge whose entire job is "how big is this" must not saturate.
+ * The estate now alerts on it — `DepositCreditsUnposted` in micro-deploy's `cf.ticket.money` — and a
+ * saturating input is a rule that cannot escalate.
+ *
+ * It also paid for the lie. Five hundred UUIDs were selected, marshalled and materialised into a JS
+ * array on every scrape on every replica, to be discarded immediately after `.length`.
+ *
+ * `pendingCredits` is unchanged and stays: the retry job genuinely wants a page of ids to work
+ * through, and a page is an honest answer to "what should this pass do". It is not an honest answer
+ * to "how big is the backlog", which is why the job no longer publishes one — see `POST_CREDIT_KIND`
+ * in `jobs.ts`.
+ *
+ * **Deliberately NOT scoped to `network`,** which is the one place this parts company with
+ * `unwatchedByChain`. That function filters because `assign` only ever writes this deployment's
+ * network and a foreign row is not this process's to repair. Here the retry job is the arbiter:
+ * `pendingCredits` carries no network predicate, so a foreign-network row IS work this process will
+ * pick up and try to post. A gauge that excluded it would hide a backlog the service is actively
+ * failing to drain — the two must select the same rows or the number stops describing the queue.
+ *
+ * Served by `deposit_credits_unposted_idx`, the partial index migration 14 adds. Without it this is
+ * a sequential scan of every deposit this service has ever credited, on every scrape on every
+ * replica, and the HEALTHY case is the expensive one: with nothing pending there is no matching row
+ * to stop early on, so a clean estate pays the most. `withdrawals_open_idx` is the same argument on
+ * the withdrawals table — "a full-table scan here would grow with settled history for ever".
+ */
+export async function pendingCreditCount(sql: Db): Promise<number> {
+  const [row] = await sql<{ pending: string }[]>`
+    select count(*)::text as pending from deposit_credits where ledger_entry_id is null
+  `
+  return Number(row?.pending ?? 0)
+}
+
 export interface DepositCreditView {
   readonly id: string
   readonly assetCode: string
