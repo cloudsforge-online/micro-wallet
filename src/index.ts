@@ -28,7 +28,7 @@ import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } fr
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
 import { indexerObservability } from './observability.ts'
-import { pendingCredits, sampleDepositAddressMetrics, type DepositDeps } from './deposits.ts'
+import { pendingCreditCount, sampleDepositAddressMetrics, type DepositDeps } from './deposits.ts'
 import type { MoneyDeps } from './money.ts'
 import type { PortfolioDeps } from './portfolio.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
@@ -226,7 +226,13 @@ const server = createServer({
     // Both of these must read zero in a healthy service, and both are invisible without a gauge:
     // a credit claimed but never posted is money the user cannot see, and an unwatched deposit
     // address is money nobody will ever be told about.
-    metrics.set('wallet_deposit_credits_pending', (await pendingCredits(db, 500)).length)
+    //
+    // `pendingCreditCount` and not `(await pendingCredits(db, 500)).length`: the second is
+    // `min(backlog, 500)`, so the series pinned at 500 and stopped moving at the point the incident
+    // was worst — and it selected 500 UUIDs on every scrape on every replica to throw them away
+    // after reading their count. The argument is on the function; `DepositCreditsUnposted` is the
+    // rule that now reads this and cannot escalate on a saturating input.
+    metrics.set('wallet_deposit_credits_pending', await pendingCreditCount(db))
     // Per chain, from one query, on every replica — and the only writer of these three series.
     // The argument for all of that is on the function; the short version is that a leased job was
     // publishing a batch-capped copy of one of them from one replica.

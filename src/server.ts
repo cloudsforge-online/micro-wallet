@@ -172,6 +172,22 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['outcome'],
     })
+    /**
+     * Money that arrived on chain, was claimed, and has not been posted to the ledger — so the
+     * owner cannot see it. Written from exactly one place, `deposits.pendingCreditCount`, called by
+     * `beforeScrape` in `index.ts`.
+     *
+     * **It is an exact count and it must stay one.** It was the `.length` of a 500-row page, so it
+     * saturated at 500 and reported the same value for a backlog of five hundred and one of forty
+     * thousand; the `deposit.post-credit` job separately wrote its own 50-row cap from whichever
+     * replica held the lease. micro-org#326 removed both. `DepositCreditsUnposted` is now deployed
+     * against this series, and a rule cannot escalate on an input that stops moving.
+     *
+     * Unlabelled, unlike the three address series below. The condition has no dimension an operator
+     * would act on differently: every unposted credit has the same repair — find out why the
+     * posting is being refused — and the `creditId` and `err` are in wallet's logs, which is where a
+     * per-row answer belongs rather than in a label Prometheus would carry for ever.
+     */
     .register({
       name: 'wallet_deposit_credits_pending',
       help: 'Deposit credits claimed locally whose ledger posting has not landed. Should be 0.',

@@ -229,7 +229,15 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
       }
       await ctx.heartbeat()
     }
-    deps.metrics.set('wallet_deposit_credits_pending', pending.length)
+    // **This job no longer publishes `wallet_deposit_credits_pending`, and must not start again.**
+    // It set the gauge to `pending.length`, which is `min(backlog, BATCH)` — a cap of 50, tighter
+    // than the cap of 500 `beforeScrape` was applying to the same series name — and it is LEASED,
+    // so the write only ever happened on the one replica holding the lease. It was harmless only
+    // because `beforeScrape` re-samples before every scrape response and overwrote it, i.e. it was
+    // a write that could never be read. That is not a reason to keep it: two writers of one series
+    // name disagreeing about the definition of the number is exactly how the address backlog got
+    // into the state `WATCH_KIND` above records, and the second writer survived there long enough
+    // to be alerted on. `deposits.pendingCreditCount` is the single, uncapped source now.
   })
 
   /**
