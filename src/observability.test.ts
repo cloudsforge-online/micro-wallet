@@ -243,12 +243,21 @@ describe('a deposit is refused for a chain this estate cannot pay back out of', 
    * and never at the asset being deposited. Keyed the other way, a deployment quoting a fee for
    * some token would have opened its whole chain.
    */
-  it('reads the fee table at the chain native asset, and the mainnet table opens exactly two chains', () => {
-    const { chains, payable } = payableFromFeeQuotes({ EMBER: 21_000_000_000_000n, LTC: 10_000n })
-    assert.deepEqual([...chains], ['ember', 'ltc'], 'the live mainnet WALLET_FEE_QUOTES, verbatim')
+  it('reads the fee table at the chain native asset, and the mainnet table opens exactly three chains', () => {
+    const { chains, payable } = payableFromFeeQuotes({
+      EMBER: 21_000_000_000_000n,
+      LTC: 10_000n,
+      BTC: 3_000n,
+    })
+    // `CHAIN_IDS` order, not the table's — the open-chain list is derived by filtering the canonical
+    // chain list, so it does not inherit whatever order somebody wrote the JSON keys in.
+    assert.deepEqual([...chains], ['ember', 'btc', 'ltc'], 'the live mainnet WALLET_FEE_QUOTES, verbatim')
     assert.equal(payable('ember'), true)
     assert.equal(payable('ltc'), true)
-    assert.equal(payable('btc'), false)
+    // BTC joined on 2026-08-11, and only after settlement could pay one out: an endpoint in
+    // `SETTLEMENT_RPC_URLS`, a UTXO source that needs no wallet RPC, a fee derived from confirmed
+    // blocks, and a provisioned treasury. DOGE has none of that and is still closed.
+    assert.equal(payable('btc'), true)
     assert.equal(payable('doge'), false)
   })
 

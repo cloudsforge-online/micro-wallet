@@ -193,7 +193,13 @@ test('refuses a chain the indexer follows but this estate cannot pay out of', { 
     ...h.deposits,
     observability: payableChainsOnly({
       observability: h.deposits.observability,
-      // What the live mainnet WALLET_FEE_QUOTES states today: EMBER and LTC, no BTC.
+      // A table this estate no longer deploys, and that is deliberate. Mainnet quoted EMBER and LTC
+      // and no BTC until 2026-08-11, when BTC gained an endpoint, a fee source and a treasury; the
+      // live table names it now, so a fixture copied from production would make the gate under test
+      // return TRUE and this whole case would assert nothing. What is being proved is the rule —
+      // indexer coverage does not open a chain, a fee quote does — and that rule outlives whichever
+      // chains happen to be open. BTC is the specimen because the harness can make the indexer
+      // follow it completely, which is the state that hides a missing gate.
       payable: payableFromFeeQuotes({ EMBER: 21_000_000_000_000n, LTC: 10_000n }).payable,
     }),
   }
