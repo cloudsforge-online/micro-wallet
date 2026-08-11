@@ -304,6 +304,45 @@ test('an address already issued on a chain that cannot pay out is counted, not j
   assert.equal(series(open, 'wallet_chain_retrievable', 'ltc'), 1)
 })
 
+test('retiring an unpayable address clears the gauge, and the key survives it', { skip }, async () => {
+  // The other half of §6.1: the gauge above is a number an operator is supposed to be able to drive
+  // to zero, and `scripts/retire-unretrievable-assignments.sql` is how. That script writes a status
+  // NOTHING in this service writes — `assign` writes `active`, a rotation writes `rotated` — so the
+  // only thing making `retired` mean "no longer outstanding" is `activeByChain`'s WHERE clause. If
+  // somebody widens that clause to "every row ever issued", the script silently stops working and
+  // the estate keeps alerting on promises it has already disowned. This pins it.
+  const assignment = await assignDepositAddress(h.deposits, {
+    userId: testUser(2),
+    assetCode: 'LTC',
+    correlationId: 'req-1',
+  })
+
+  const before = registerServiceMetrics(new Metrics())
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n }), before)
+  assert.equal(series(before, 'wallet_deposit_addresses_unretrievable', 'ltc'), 1)
+
+  await h.deposits.sql`
+    update deposit_address_assignments set status = 'retired' where id = ${assignment.id}
+  `
+
+  const after = registerServiceMetrics(new Metrics())
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n }), after)
+  assert.equal(series(after, 'wallet_deposit_addresses_unretrievable', 'ltc'), 0)
+  // Still 0, not absent: a chain whose backlog has cleared must keep publishing its zero or an
+  // alert cannot tell "resolved" from "the series went away".
+  assert.notEqual(series(after, 'wallet_deposit_addresses_unretrievable', 'ltc'), null)
+
+  // And the address is still ours. The row, its custody key and its wallet are all deliberately
+  // left intact — retiring is a statement about what this estate will OFFER, not about who owns a
+  // coin that already arrived. Deleting the key to tidy the row would turn an unwatched balance
+  // into an unspendable one, which is strictly worse than the defect being fixed.
+  const [row] = await h.deposits.sql<{ custody_key_urn: string; address: string }[]>`
+    select custody_key_urn, address from deposit_address_assignments where id = ${assignment.id}
+  `
+  assert.equal(row?.address, assignment.address)
+  assert.equal(row?.custody_key_urn, assignment.custodyKeyUrn)
+})
+
 /* --------------------------------------------------------------- the writer */
 
 /**
