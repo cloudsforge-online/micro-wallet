@@ -25,7 +25,7 @@ running and is the rollback target; nothing in it is modified.
 | Wallet registry | `wallet` rows with `origin` (`managed`/`external`/`watch`), a lifecycle, and at most one primary per `(user, chain, network)` | 04-domain-model §3.1 |
 | External wallets | `external_wallet_link` with signed-challenge verification and a closed, individually revocable authorisation set | §3.2 |
 | Deposits | `deposit_address_assignment` per `(user, asset, network)`, registered with the indexer, credited on `indexer.deposit.confirmed` | §3.4 |
-| Withdrawals | Request, validate, quote, **reserve through the ledger**, queue for `micro-settlement` | §4.4 |
+| Withdrawals | Request, validate, quote, **reserve through the ledger**, hand to `micro-settlement`, which builds and broadcasts. LTC and BTC pay today; an MWEB destination is refused (see "What is not here") | §4.4 |
 | Conversions, transfers, spends | Ledger entries, every one requiring an idempotency key | §2.2 |
 | Portfolio | Ledger balances composed with indexer-observed chain activity, paged | — |
 
@@ -155,10 +155,23 @@ rotation is a new row here, so the state cannot arise. See micro-org#310.
 
 ## What is not here
 
-* **Sending the payment.** That is `micro-settlement`, which does not exist yet.
-  `src/settlement.ts` is the interface it will implement, and `wallet.withdrawal.requested` is the
-  handover. The outbox makes emitting into the void correct rather than merely tolerable: the relay
-  computes its delivery set from the live subscription list on every pass.
+* **Sending the payment.** That is `micro-settlement`. `src/settlement.ts` is the interface, and
+  `wallet.withdrawal.requested` is the handover; the outbox relay computes its delivery set from
+  the live subscription list on every pass.
+
+  **This paragraph used to end "which does not exist yet" and "emitting into the void".** It is not
+  true any more, and the difference matters to whoever is on call: `wallet.withdrawal.requested`
+  has a live consumer, so **a withdrawal that is not paid is an incident, not the expected state.**
+  Settlement builds and broadcasts on the UTXO chains from a wallet-less source — it derives
+  spendable outputs itself rather than asking a node's wallet, which the estate's nodes do not run
+  — and it sends the HTTP Basic `Authorization` header that `URL.origin` silently discards, which
+  was the single line that made every UTXO withdrawal answer 401. LTC and BTC are payable. DOGE is
+  not: it is merge-mined against Litecoin under AuxPoW and has no settlement path of its own here.
+
+  **One gap worth naming before a user finds it: `src/addresses.ts` has no MWEB handling.** MWEB is
+  live on Litecoin and a `ltcmweb1…` destination is refused by address validation, with no message
+  that explains why. That is a refusal rather than a loss — the withdrawal never leaves — but the
+  user is told nothing useful.
 * **Watching the chain.** That is the indexer. AD-07, and the reason deposits here carry real
   transaction hashes for the first time in the estate.
 * **Holding keys.** That is custody. §3.3.
