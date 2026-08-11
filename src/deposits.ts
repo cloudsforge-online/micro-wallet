@@ -574,6 +574,31 @@ export async function unwatchedByChain(
 }
 
 /**
+ * Addresses this deployment has issued and not withdrawn, per chain.
+ *
+ * `status = 'active'` and not every row: `rotated` and `retired` assignments stay in the table as
+ * history and are no longer the address anybody was given, so counting them would inflate the
+ * outstanding promise by exactly the addresses that are not outstanding. `watched_at` is NOT part
+ * of this — an unwatched address is a different defect with its own gauge, and an address can be
+ * perfectly watched and still be on a chain nothing can pay out of, which is the whole point.
+ *
+ * Filtered to this deployment's network for the reason `unwatchedByChain` is: a row for the other
+ * network is not this process's promise and it cannot act on it.
+ */
+export async function activeByChain(
+  sql: Db,
+  network: Network,
+): Promise<ReadonlyMap<string, number>> {
+  const rows = await sql<{ chain: string; issued: string }[]>`
+    select chain, count(*)::text as issued
+      from deposit_address_assignments
+     where status = 'active' and network = ${network}
+     group by chain
+  `
+  return new Map(rows.map((row) => [row.chain, Number(row.issued)]))
+}
+
+/**
  * Publish the deposit-address backlog at scrape time.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -616,7 +641,10 @@ export async function sampleDepositAddressMetrics(
   deps: Pick<DepositDeps, 'sql' | 'network' | 'observability'>,
   metrics: Metrics,
 ): Promise<void> {
-  const backlog = await unwatchedByChain(deps.sql, deps.network)
+  const [backlog, issued] = await Promise.all([
+    unwatchedByChain(deps.sql, deps.network),
+    activeByChain(deps.sql, deps.network),
+  ])
   // In parallel: the answers are cached for 60s, so this is at most one round trip per chain per
   // minute per replica, and a scrape must not cost eight sequential ones.
   const observed = await Promise.all(
@@ -649,9 +677,24 @@ export async function sampleDepositAddressMetrics(
     // fee for it — a deliberate refusal whose repair is a `WALLET_FEE_QUOTES` entry, not a node.
     // Without this series an operator staring at `wallet_chain_observable{chain="btc"} 0` after
     // switching the indexer on would go looking at the indexer, and find nothing wrong with it.
+    //
+    // **This was `wallet_chain_not_retrievable` and it never reached a single scrape.** The name was
+    // never passed to `metrics.register`, and `Metrics.set` drops an unregistered write on its first
+    // line — reported once to stderr, rendered never. So the series the paragraph above says an
+    // operator needs did not exist, on any replica, from 2.5.18 until now. Measured on mainnet
+    // 2026-08-11: `/metrics` carried `wallet_chain_observable` and
+    // `wallet_chain_observability_unknown` and no third series at all. It is positive sense now —
+    // see the spec in `server.ts` — so the gate reads as the conjunction it is.
+    metrics.set('wallet_chain_retrievable', observation.reason === 'not_retrievable' ? 0 : 1, {
+      chain,
+    })
+    // Promises already outstanding on a chain that is closed NOW. The gate refuses new addresses;
+    // it cannot recall the ones handed out before it existed, and micro-org#373 §6.2 is one of
+    // those. A zero is written for every chain on every scrape for the same reason the gauges above
+    // write theirs — absent and healthy must not be the same shape to an alert.
     metrics.set(
-      'wallet_chain_not_retrievable',
-      observation.reason === 'not_retrievable' ? 1 : 0,
+      'wallet_deposit_addresses_unretrievable',
+      observation.reason === 'not_retrievable' ? (issued.get(chain) ?? 0) : 0,
       { chain },
     )
   }

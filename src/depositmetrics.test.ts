@@ -22,7 +22,7 @@
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import type postgres from 'postgres'
-import { Metrics } from '@cloudsforge/telemetry'
+import { Metrics, type DroppedMetricWrite } from '@cloudsforge/telemetry'
 import { CHAIN_IDS } from './addresses.ts'
 import {
   assignDepositAddress,
@@ -33,7 +33,7 @@ import {
   unwatchedByChain,
 } from './deposits.ts'
 import { IndexerUnavailableError } from './indexerclient.ts'
-import { indexerObservability } from './observability.ts'
+import { indexerObservability, payableChainsOnly, payableFromFeeQuotes } from './observability.ts'
 import { registerServiceMetrics } from './server.ts'
 import { POST_CREDIT_KIND, WATCH_KIND, registerHandlers } from './jobs.ts'
 import type { JobRunner } from '@cloudsforge/jobs'
@@ -222,6 +222,86 @@ test('“the indexer follows no source” and “we could not ask” are two ser
 
   assert.equal(series(metrics, 'wallet_chain_observable', 'ember'), 0)
   assert.equal(series(metrics, 'wallet_chain_observability_unknown', 'ember'), 1)
+})
+
+/* -------------------------------------------------------------- retrievability */
+
+/**
+ * The deposit gate as this service actually assembles it in `index.ts`: the payability check
+ * OUTERMOST, so a chain this deployment cannot pay out of never reaches the indexer at all.
+ * `feeQuotes` names the assets an operator has stated a withdrawal fee for.
+ */
+function gated(feeQuotes: Record<string, bigint>): Parameters<typeof sampleDepositAddressMetrics>[0] {
+  return {
+    ...h.deposits,
+    observability: payableChainsOnly({
+      observability: h.deposits.observability,
+      payable: payableFromFeeQuotes(feeQuotes).payable,
+    }),
+  }
+}
+
+test('retrievability is a series of its own, and a scrape actually carries it', { skip }, async () => {
+  // micro-org#373 §6.1's gate has been shipping since 2.5.18 and its series has never once been
+  // scraped: `deposits.ts` wrote `wallet_chain_not_retrievable`, `server.ts` never registered that
+  // name, and `Metrics.set` drops an unregistered write on its first line. Measured on the running
+  // mainnet container on 2026-08-11 — `/metrics` carried the two gauges below and no third one.
+  // So this asserts the series RENDERS, not that a setter was called: `series()` returns null for a
+  // name absent from `render()`, which is exactly the state the defect left production in.
+  const metrics = registerServiceMetrics(new Metrics())
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n }), metrics)
+
+  // EMBER: the fee table names it and the indexer follows it. Both halves, so the gate is open.
+  assert.equal(series(metrics, 'wallet_chain_retrievable', 'ember'), 1)
+  assert.equal(series(metrics, 'wallet_chain_observable', 'ember'), 1)
+
+  // LTC: the indexer follows it PERFECTLY — that is the state in which a missing second condition
+  // looks fine — and the fee table does not name it, so the gate is shut. An operator reading only
+  // `wallet_chain_observable` sees a 0 identical to an indexer outage's and goes to the wrong
+  // service; the two series below are what tell them apart without reading source.
+  assert.equal(series(metrics, 'wallet_chain_retrievable', 'ltc'), 0)
+  assert.equal(series(metrics, 'wallet_chain_observable', 'ltc'), 0)
+  assert.equal(series(metrics, 'wallet_chain_observability_unknown', 'ltc'), 0)
+})
+
+test('a scrape publishes every series it writes', { skip }, async () => {
+  // The general form of the defect above, and the reason it survived a release: a metric write to a
+  // name nobody registered is REPORTED and never thrown, by design — observability failing must not
+  // become an outage — so the only trace was one deduplicated stderr line at boot. Asserting the
+  // registry dropped nothing catches the next one at the commit that introduces it, whatever it is
+  // called, rather than at the next time somebody opens a dashboard looking for it.
+  const dropped: DroppedMetricWrite[] = []
+  const metrics = registerServiceMetrics(new Metrics({ onDropped: (d) => dropped.push(d) }))
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n }), metrics)
+  assert.deepEqual(dropped, [], 'a scrape wrote a series no operator can read')
+})
+
+test('an address already issued on a chain that cannot pay out is counted, not just refused', { skip }, async () => {
+  // micro-org#373 §6.2, generalised. The gate shuts the door on NEW addresses and cannot recall the
+  // ones handed out before it existed — on mainnet that is a `btc | mainnet` assignment from
+  // 2026-08-05, one of six chains a single scripted account took an address on in three seconds,
+  // three of which (eth, sol, xrp) are still unpayable today. Finding them took psql. They are a
+  // number now.
+  await assignDepositAddress(h.deposits, {
+    userId: testUser(1),
+    assetCode: 'LTC',
+    correlationId: 'req-0',
+  })
+
+  const shut = registerServiceMetrics(new Metrics())
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n }), shut)
+  assert.equal(series(shut, 'wallet_deposit_addresses_unretrievable', 'ltc'), 1)
+  // Not a count of addresses: EMBER is payable, so its assignments are promises this deployment can
+  // keep and are not outstanding against anything.
+  assert.equal(series(shut, 'wallet_deposit_addresses_unretrievable', 'ember'), 0)
+
+  // The same row, the same instant, one `WALLET_FEE_QUOTES` entry later. This is what proves the
+  // gauge reads the retrievability condition rather than counting rows on a chain nobody deposits
+  // on: nothing about the assignment changed and the number is 0.
+  const open = registerServiceMetrics(new Metrics())
+  await sampleDepositAddressMetrics(gated({ EMBER: 21_000_000_000_000n, LTC: 10_000n }), open)
+  assert.equal(series(open, 'wallet_deposit_addresses_unretrievable', 'ltc'), 0)
+  assert.equal(series(open, 'wallet_chain_retrievable', 'ltc'), 1)
 })
 
 /* --------------------------------------------------------------- the writer */

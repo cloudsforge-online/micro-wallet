@@ -113,23 +113,39 @@ There is no signing in this service and there never will be.
 
 ## What a scrape says about deposit addresses
 
-Four series, all labelled by `chain`, all written together at scrape time by
+Six series, all labelled by `chain`, all written together at scrape time by
 `sampleDepositAddressMetrics` and meant to be read together:
 
 | Series | Means |
 | --- | --- |
 | `wallet_deposit_addresses_unwatched{chain}` | Addresses the indexer has not been asked to watch. Money sent to one produces no event. |
 | `wallet_deposit_addresses_unobservable{chain}` | The part of that backlog on a chain the indexer follows no source for. Not a fault — an owner deciding whether to support the chain. |
-| `wallet_chain_observable{chain}` | 1 if deposits on the chain are issued and credited at all. |
+| `wallet_deposit_addresses_unretrievable{chain}` | Active addresses already issued on a chain this deployment states no way to pay out of. Promises outstanding against a capability that is gone or never arrived. |
+| `wallet_chain_observable{chain}` | 1 if deposits on the chain are issued and credited at all. **An AND of the two conditions below.** |
+| `wallet_chain_retrievable{chain}` | 1 if `WALLET_FEE_QUOTES` names the chain's native asset, so a withdrawal can be priced. 0 shuts deposits however well the indexer follows the chain. |
 | `wallet_chain_observability_unknown{chain}` | 1 if this replica has *never obtained an answer* and is refusing on that basis. |
 
 `unwatched - unobservable` per chain is the part somebody has to fix, and it is the only honest
-alerting expression over these. The last row exists because a 0 on `wallet_chain_observable` is two
-conditions with opposite repairs — "no source is followed" and "we could not ask" — and a gauge
-cannot say *unknown*; the same reason `ledger_reconciliation_observed` sits beside
-`ledger_reconciliation_drift`. Every chain gets a **measured** zero on every scrape rather than an
+alerting expression over these. Every chain gets a **measured** zero on every scrape rather than an
 absent series, because absent and healthy are the same shape to an alert, and because a labelled
 gauge cannot be removed once set.
+
+**A 0 on `wallet_chain_observable` is three conditions with three different repairs**, which is why
+the other two 0/1 series exist rather than being folded into it:
+
+* `wallet_chain_retrievable == 0` — this deployment has stated no withdrawal fee for the chain's
+  coin. The repair is a `WALLET_FEE_QUOTES` entry, and nothing about the indexer is wrong.
+* `wallet_chain_observability_unknown == 1` — this replica has never obtained an answer. A fault,
+  and it is refusing deposits right now.
+* both 0 — the indexer follows no source for the chain. An owner's decision, and the steady state
+  for most chains.
+
+The second one is the reason a gauge cannot simply say *unknown*; the same reason
+`ledger_reconciliation_observed` sits beside `ledger_reconciliation_drift`. The first arrived with
+the deposit gate in micro-org#373 §6.1 — **and did not arrive with it.** The write existed from
+2.5.18 and the name was never registered, so `Metrics.set` dropped it silently and the series
+reached no scrape until 2.5.21. An operator watching `wallet_chain_observable{chain="btc"}` go to 0
+had nothing to distinguish a fee table from an outage.
 
 **There is no such thing as a frozen deposit address here, and no metric will ever report one.**
 `deposit_address_assignments_status_ck` admits `active`, `rotated` and `retired`. The state a

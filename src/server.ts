@@ -242,24 +242,85 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       labels: ['chain'],
     })
     /**
+     * **Deposit addresses this deployment has already issued on a chain it cannot pay out of** —
+     * promises outstanding against a capability that is gone or never arrived.
+     *
+     * The gate in `observability.ts` shuts the door on NEW addresses. It cannot recall the ones
+     * already handed out, and micro-org#373 §6.2 is exactly one of those: a `btc | mainnet`
+     * assignment minted on 2026-08-05, before #183 closed, on an estate where nothing followed
+     * Bitcoin and nothing could move a satoshi. Auditing it took a psql session and a full
+     * `scantxoutset`; nothing said the row existed. It was not alone — one account's scripted run
+     * that morning took an address on six chains in three seconds, and three of those (eth, sol,
+     * xrp) are still on chains this estate can neither watch nor pay.
+     *
+     * So the class gets a series rather than the instance getting a note. Non-zero is not
+     * automatically a fault — a chain can close after an address was issued, which is an owner's
+     * decision — but it is always a number somebody should be able to state, and until now nobody
+     * could. `active` assignments only: a rotated or retired address is no longer a promise.
+     */
+    .register({
+      name: 'wallet_deposit_addresses_unretrievable',
+      help:
+        'Active deposit addresses issued on a chain this deployment states no way to pay out of. ' +
+        'Coins sent to them would be held with no withdrawal path. See wallet_chain_retrievable.',
+      kind: 'gauge',
+      labels: ['chain'],
+    })
+    /**
      * **Whether this deployment will issue and credit a deposit address on this chain at all** —
      * the one fact behind every refusal on the deposit path, and invisible from outside until now.
      *
-     * `micro-indexer` follows ONE chain per estate (`INDEXER_CHAINS=ember:mainnet` on the running
-     * container), so seven of these eight read 0 on mainnet today and the estate had no series
-     * saying so. An operator asking "can we take Bitcoin deposits" had to read a container's
-     * environment. It is a gauge rather than a config assertion because the answer is MEASURED from
-     * the indexer per deployment — see `observability.ts` on why a second hardcoded list of
-     * supported chains is how the estate came to hand out a real Bitcoin address nothing watched.
+     * It is a gauge rather than a config assertion because the answer is MEASURED per deployment —
+     * see `observability.ts` on why a second hardcoded list of supported chains is how the estate
+     * came to hand out a real Bitcoin address nothing watched.
      *
      * It reports the GATE'S DECISION, not the chain's truth: an indexer this process cannot reach
      * and has no cached answer for reads 0, because 0 is what the deposit path will act on.
+     *
+     * **Since micro-org#373 §6.1 this is an AND of two independent conditions**, and the help text
+     * below used to name only the first. That mattered: an operator who read "1 if the indexer
+     * reports a source" off a `chain="btc"` zero would go and look at the indexer, and find nothing
+     * wrong with it, because the refusal was a missing `WALLET_FEE_QUOTES` entry. The two
+     * conditions each have their own series so the zero can be decomposed without reading source.
      */
     .register({
       name: 'wallet_chain_observable',
       help:
-        '1 if the indexer reports a source for this chain, so deposits on it are issued and ' +
-        'credited; 0 if not. Read it with wallet_chain_observability_unknown.',
+        '1 if this deployment issues and credits deposit addresses on this chain. It is an AND: ' +
+        'the indexer reports a source AND a withdrawal of the native asset can be priced. ' +
+        'Decompose a 0 with wallet_chain_retrievable and wallet_chain_observability_unknown.',
+      kind: 'gauge',
+      labels: ['chain'],
+    })
+    /**
+     * **The second half of the gate, and the one an indexer dashboard cannot explain.**
+     *
+     * `wallet_chain_observable` was the whole gate until micro-org#373 §6.1: adding a scope to the
+     * indexer's `INDEXER_CHAINS` opened this service's deposit route for that chain in the same
+     * instant, with no second decision anywhere. §6.1 measured what that meant for Bitcoin — a
+     * complete PSBT adapter in micro-settlement that could not run against the estate's node — and
+     * the repair was a second condition read from `WALLET_FEE_QUOTES`, the table where an operator
+     * already states "this estate can pay this asset out".
+     *
+     * **Positive sense, and deliberately so.** The write this replaces was
+     * `wallet_chain_not_retrievable`, and it was never registered here, so `Metrics.set` dropped it
+     * on its first line and the series has never appeared on a single scrape — the §6.1 gate has
+     * been refusing deposits with no way for an operator to see it since 2.5.18. Renaming it costs
+     * nothing precisely because nothing has ever been able to read it. What positive sense buys is
+     * that the decomposition reads as written: `observable` is `retrievable` AND an indexer answer,
+     * so `retrievable == 1 and observable == 0` names the indexer as the blocker and
+     * `retrievable == 0` names the fee table, with no negation to hold in your head.
+     *
+     * This never consults the indexer. `payableChainsOnly` is the OUTERMOST gate and short-circuits
+     * before the request is made, so this series is available even when the indexer is down — which
+     * is the moment an operator most needs to know which of the two conditions they are looking at.
+     */
+    .register({
+      name: 'wallet_chain_retrievable',
+      help:
+        '1 if this deployment states a way to send the chain native asset back out, read from ' +
+        'WALLET_FEE_QUOTES; 0 if not, in which case deposits are refused however well the indexer ' +
+        'follows the chain. A deposit address is a promise the coins remain retrievable.',
       kind: 'gauge',
       labels: ['chain'],
     })
