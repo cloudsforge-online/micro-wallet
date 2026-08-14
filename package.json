@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/wallet",
-  "version": "2026.08.44",
+  "version": "2026.08.45",
   "private": true,
   "description": "The user-facing money API. Wallet registry, external wallet links and verification, deposit address assignment, withdrawal requests, conversions, transfers and the portfolio read. Owns no balances and no keys.",
   "license": "MIT",
