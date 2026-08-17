@@ -62,9 +62,29 @@ export type UnobservableReason =
   /** We could not ask, and have never had an answer to fall back on. */
   | 'unknown'
   /**
-   * The estate can watch the chain but has stated no way to pay anything back out on it. See
+   * This deployment has stated no way to pay the chain's native asset back out. See
    * `payableChainsOnly` — an address we can see money arrive at and cannot send money from is a
    * promise this deployment has not made.
+   *
+   * ── IT USED TO SAY "the estate CAN watch the chain but…", AND THAT HALF WAS NEVER MEASURED ────
+   *
+   * micro-org#481. `payableChainsOnly` is the outermost gate and answers this reason **without
+   * asking the indexer anything**, so the "can watch" half was an assumption the value asserted and
+   * nothing checked. On the mainnet estate, measured 2026-08-17, it was false for four of the five
+   * chains that receive it: `WALLET_FEE_QUOTES` opens `ember, btc, ltc`, and `INDEXER_CHAINS` is
+   * `ember:mainnet, ltc:mainnet, btc:mainnet` — so DOGE, ETC, SOL and XRP were each reported as a
+   * chain the estate watches and cannot pay out of, when in fact nothing watches them at all.
+   *
+   * That is the wrong way round for the person reading it. "We see your coin and cannot send it
+   * back" invites someone to deposit and wait; "nothing here is watching that chain" tells them not
+   * to send. Dogecoin is the case the owner actually hit (micro-org#481): no dogecoind is reachable
+   * from this estate, `GET /v1/chains/doge/mainnet/status` answers `followed: false, providers: []`,
+   * and the deposit catalogue was calling that `not_retrievable`.
+   *
+   * So this value now means exactly what `payableChainsOnly` knows and no more, and
+   * `chainAvailability` — which the CATALOGUE uses, where a round trip is affordable — prefers
+   * `not_followed` whenever the indexer says so, because that is the more fundamental fact and the
+   * one that changes the advice.
    */
   | 'not_retrievable'
 
@@ -187,6 +207,94 @@ export function payableChainsOnly(options: PayableOptions): ChainObservability {
       }
       return options.observability.observe(chain, network)
     },
+  }
+}
+
+/**
+ * **The same verdict as `payableChainsOnly`, with the reason the CATALOGUE owes a reader.**
+ *
+ * micro-org#481. `GET /v1/deposits/assets` and `POST /v1/deposits` are asking two different
+ * questions of the same two gates, and only one of them is a gate:
+ *
+ *   - `POST /v1/deposits` decides whether to mint an address. It wants the cheapest sufficient
+ *     refusal, and `payableChainsOnly`'s short circuit is exactly right for it — the indexer's
+ *     answer cannot change the outcome, and not asking keeps an unconfigured chain off the
+ *     indexer's request budget on a per-user path. **That is not changed here and must not be.**
+ *   - `GET /v1/deposits/assets` DESCRIBES the estate. It is one read per chain per sixty seconds
+ *     behind the same cache, it already asks the indexer about every chain the fee table opens, and
+ *     its entire job is to say why an asset is not offered. A refusal it cannot explain correctly is
+ *     the whole defect it exists to prevent.
+ *
+ * So this port asks BOTH and then applies the payable gate on top. **The gate is unchanged**: if
+ * the chain is not payable, `observable` is `false` whatever the indexer said, so turning a chain on
+ * in `INDEXER_CHAINS` still cannot open deposits as a side effect of a decision that was about
+ * something else. The only thing that moves is which of two true sentences gets told.
+ *
+ * `not_followed` wins over `not_retrievable` when both apply, and that ordering is the point rather
+ * than a tie-break: they lead to different advice. `not_retrievable` says an operator has a fee to
+ * quote; `not_followed` says there is no node, and no fee quote in the world would help. Dogecoin on
+ * the mainnet estate is the second, and was being reported as the first.
+ *
+ * An `unknown` from the indexer — it could not be asked — does NOT survive the gate, because the
+ * payable half is a certainty on its own and `unknown` reads as "try again shortly", which is advice
+ * for a chain that is one outage away from working rather than one this deployment has closed.
+ */
+export function chainAvailability(options: PayableOptions): ChainObservability {
+  return {
+    async observe(chain, network) {
+      const observed = await options.observability.observe(chain, network)
+      if (options.payable(chain)) return observed
+      return {
+        ...observed,
+        observable: false,
+        reason: observed.reason === 'not_followed' ? 'not_followed' : 'not_retrievable',
+      }
+    },
+  }
+}
+
+/**
+ * Why an asset is not on offer, as a sentence rather than as a word.
+ *
+ * ── A CONSUMER THAT KNOWS ONLY `depositable: false` RENDERS NOTHING AT ALL ─────────────────────
+ *
+ * micro-org#481, reported as "I don't see any Dogecoin reference in the wallet". `micro-wallet` was
+ * already answering honestly — `GET /v1/deposits/assets` carried a DOGE row with `depositable:
+ * false` — and the surface reading it dropped every refused row before drawing, so the one place the
+ * estate said anything about Dogecoin never reached a screen. A machine-readable enum a client has
+ * to write its own prose for is prose the client will not write.
+ *
+ * This is `pool/src/chains.ts`'s rule, and it argues it against exactly the same mistake: *"a bare
+ * boolean was the first shape and it was wrong … a consumer that knows only 'false' renders
+ * 'unavailable', which reads as an outage the operator will fix, and the reader waits for something
+ * that is never going to change."* `micro-pool-web` renders that reason verbatim; this gives a
+ * wallet surface the same thing to render.
+ *
+ * The sentences are shared with `assertObservable`, which raises them as the `DepositError` message
+ * on `POST /v1/deposits`, so the list and the refusal cannot drift into saying different things
+ * about one asset — which is the failure a second copy of a sentence always eventually produces.
+ */
+export function unobservableDetail(assetCode: string, reason: UnobservableReason): string {
+  switch (reason) {
+    case 'not_retrievable':
+      // Deliberately does not name WHICH chains this deployment can pay out on: that is an
+      // operational fact and belongs in the log line, not on a public catalogue.
+      return (
+        `${assetCode} deposits are not available on this deployment yet. This estate cannot send ` +
+        `${assetCode} back out, and it will not take a deposit it could not return — which is why ` +
+        'no address has been issued.'
+      )
+    case 'unknown':
+      return (
+        `we could not confirm that ${assetCode} deposits are being watched right now, so no address ` +
+        'has been issued. Nothing is wrong with your account — please try again shortly.'
+      )
+    case 'not_followed':
+      return (
+        `${assetCode} deposits are not available on this deployment yet. An address would be real ` +
+        'and nothing would be watching it, so anything sent to it would not be credited — which is ' +
+        'why none has been issued.'
+      )
   }
 }
 

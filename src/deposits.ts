@@ -60,7 +60,11 @@ import {
 import { uuidv7 } from './ids.ts'
 import { CustodyRefusedError, type CustodyAddress, type CustodyClient } from './custodyclient.ts'
 import type { IndexerClient } from './indexerclient.ts'
-import type { ChainObservability } from './observability.ts'
+import {
+  unobservableDetail,
+  type ChainObservability,
+  type UnobservableReason,
+} from './observability.ts'
 import type { LedgerClient } from './ledgerclient.ts'
 import {
   DEPOSIT_ADDRESS_ASSIGNED,
@@ -156,6 +160,21 @@ export interface DepositDeps {
    * from is a balance nobody can withdraw — micro-org#373 §6.1). See `observability.ts`.
    */
   readonly observability: ChainObservability
+  /**
+   * The same two questions, asked the way a CATALOGUE has to ask them — `chainAvailability` rather
+   * than `payableChainsOnly`. micro-org#481.
+   *
+   * It reaches the identical verdict and differs only in the reason it can give, because the gate
+   * above short-circuits before consulting the indexer and therefore cannot tell "we do not follow
+   * this chain" from "we follow it and cannot pay it out". That short circuit is right for
+   * `assignDepositAddress`, which is a per-user path where the answer cannot change the outcome, and
+   * wrong for `depositableAssets`, whose whole output is the reason.
+   *
+   * Two fields rather than one port used two ways, so that a future edit to either cannot silently
+   * change the other: the gate is the thing that must never loosen, and it is named separately from
+   * the thing that only describes.
+   */
+  readonly availability: ChainObservability
 }
 
 /* ------------------------------------------------------------------ assignment */
@@ -189,36 +208,26 @@ async function assertObservable(
 ): Promise<void> {
   const observation = await deps.observability.observe(chain, deps.network)
   if (observation.observable) return
+  // The three sentences live in `observability.ts` and are shared with `depositableAssets`, so the
+  // catalogue that says an asset is not offered and the refusal somebody gets when they ask for it
+  // anyway cannot drift into two different explanations of one fact. micro-org#481.
   if (observation.reason === 'not_retrievable') {
     // Separate from `asset_not_observable` on the wire for the same reason those two are separate
-    // from each other: it is a different fact about the deployment. This estate can SEE the chain
-    // and has stated no way to send anything back out on it (micro-org#373 §6.1), so an address
-    // would be watched, and credited, and the balance would be one nobody could withdraw. The
-    // person is told the asset is unavailable and not why, deliberately — which chains a
-    // deployment can pay out on is an operational fact, and the log line carries it.
+    // from each other: it is a different fact about the deployment. This estate has stated no way
+    // to send anything back out on the chain (micro-org#373 §6.1), so an address would be watched,
+    // and credited, and the balance would be one nobody could withdraw. The person is told the
+    // asset is unavailable and not why, deliberately — which chains a deployment can pay out on is
+    // an operational fact, and the log line carries it.
     throw new DepositError(
       'asset_not_withdrawable',
-      `${assetCode} deposits are not available on this deployment yet. This estate cannot send ` +
-        `${assetCode} back out, and it will not take a deposit it could not return — which is why ` +
-        'no address has been issued.',
+      unobservableDetail(assetCode, 'not_retrievable'),
       503,
     )
   }
   if (observation.reason === 'unknown') {
-    throw new DepositError(
-      'observability_unknown',
-      `we could not confirm that ${assetCode} deposits are being watched right now, so no address ` +
-        'has been issued. Nothing is wrong with your account — please try again shortly.',
-      503,
-    )
+    throw new DepositError('observability_unknown', unobservableDetail(assetCode, 'unknown'), 503)
   }
-  throw new DepositError(
-    'asset_not_observable',
-    `${assetCode} deposits are not available on this deployment yet. An address would be real and ` +
-      'nothing would be watching it, so anything sent to it would not be credited — which is why ' +
-      'none has been issued.',
-    503,
-  )
+  throw new DepositError('asset_not_observable', unobservableDetail(assetCode, 'not_followed'), 503)
 }
 
 /**
@@ -454,27 +463,79 @@ async function watch(
  * refuse" is the rule that keeps a wallet honest. The list has to come from whatever `assign`
  * itself would decide, or the two drift the moment a chain is added or a provider fails.
  *
- * So this asks the SAME `observability.observe` that `assertObservable` asks, per chain, and
- * reports the answer with its reason. Since micro-org#373 §6.1 that port is the composed gate, so
- * a chain this deployment cannot pay out of is reported `not_retrievable` here and is never
- * offered — which is the whole point of asking `assign` rather than describing what it does. `unavailable` is not a synonym for `unsupported`: the first
- * may be true for ten minutes, the second until someone deploys a node, and a person deciding
- * whether to wait deserves to know which.
+ * So this asks the same two gates `assertObservable` asks, per chain, and reports the answer with
+ * its reason. `unavailable` is not a synonym for `unsupported`: the first may be true for ten
+ * minutes, the second until someone deploys a node, and a person deciding whether to wait deserves
+ * to know which.
+ *
+ * ── IT ASKS `availability`, NOT `observability`, AND THE DIFFERENCE IS THE WHOLE OF #481 ────────
+ *
+ * This read `deps.observability` — the deposit GATE — until micro-org#481, on the reasoning that a
+ * catalogue built from anything other than what `assign` would decide will drift away from it. That
+ * reasoning is right about the VERDICT and was wrong about the REASON, and the two are not the same
+ * question. `payableChainsOnly` short-circuits before it consults the indexer, so on a chain with no
+ * fee quote it reports `not_retrievable` — "we watch it and cannot pay it out" — without having
+ * asked whether anything watches it.
+ *
+ * Measured on the mainnet estate, 2026-08-17: `WALLET_FEE_QUOTES` opens `ember, btc, ltc`, and
+ * `INDEXER_CHAINS` is `ember:mainnet, ltc:mainnet, btc:mainnet`. So DOGE, ETC, SOL and XRP were all
+ * reported `not_retrievable`, and for all four the first half of that sentence is false — the
+ * indexer answers `followed: false, providers: []` for every one of them. The owner asked why there
+ * was no Dogecoin anywhere in the wallet, and the answer this route was giving pointed at the fee
+ * table when the truth is that no dogecoind is reachable from this estate at all.
+ *
+ * `chainAvailability` reaches the identical verdict — the gate does not loosen by one chain, and
+ * `depositable` is byte-for-byte what it was — and picks the reason that is actually true. The
+ * verdict comes from the gate's own composition and never from this loop.
+ *
+ * ── AND EVERY ROW NOW CARRIES A SENTENCE, BECAUSE AN ENUM WAS NOT REACHING ANYBODY ──────────────
+ *
+ * The reported symptom was "no Dogecoin reference in the wallet", and the DOGE row was in this
+ * response the whole time. `hub-web`'s Receive panel does `assets.filter((a) => a.depositable)`
+ * before it draws, so every refused asset — and its reason — is discarded by the only consumer.
+ * That filter is not wrong on its own terms: `reason` is a machine word, and a client holding
+ * `'not_followed'` has to invent the prose, which is prose no client writes.
+ *
+ * `detail` is that prose, shared verbatim with the 503 `assign` raises for the same asset. It does
+ * not force any surface to render the row, and it removes the excuse for not doing so — which is
+ * exactly what `pool/src/chains.ts` did for the browser-mining refusal and `micro-pool-web` renders
+ * verbatim today.
  */
-export async function depositableAssets(
-  deps: DepositDeps,
-): Promise<readonly { assetCode: string; chain: ChainId; depositable: boolean; reason: string | null }[]> {
-  const out: { assetCode: string; chain: ChainId; depositable: boolean; reason: string | null }[] = []
+export interface DepositableAsset {
+  readonly assetCode: string
+  readonly chain: ChainId
+  readonly depositable: boolean
+  /** The machine word. `null` exactly when `depositable` is true. */
+  readonly reason: UnobservableReason | null
+  /**
+   * The same fact as a sentence a surface can render without writing its own. `null` exactly when
+   * `depositable` is true — an asset that IS on offer needs no explanation, and a string there
+   * would be a caption looking for somewhere to be drawn.
+   */
+  readonly detail: string | null
+}
+
+/**
+ * Narrowed to the two fields it actually reads, and not to `DepositDeps` entire.
+ *
+ * A catalogue that took the whole bundle could grow a database read or a custody call without the
+ * signature changing, and this route must stay a pure description of configuration: it is
+ * unauthenticated per user, called on page load, and answers the same thing for everybody.
+ */
+export type CatalogueDeps = Pick<DepositDeps, 'availability' | 'network'>
+
+export async function depositableAssets(deps: CatalogueDeps): Promise<readonly DepositableAsset[]> {
+  const out: DepositableAsset[] = []
   // Cached per chain: several assets can share one (an ERC-20 and ETH), and asking the indexer
   // once per ASSET would multiply the same question by the size of the catalogue.
-  const seen = new Map<ChainId, { observable: boolean; reason: string | null }>()
+  const seen = new Map<ChainId, { observable: boolean; reason: UnobservableReason | null }>()
   for (const assetCode of ON_CHAIN_ASSETS) {
     const chain = chainForAsset(assetCode)
     if (chain === null) continue
     let observation = seen.get(chain)
     if (observation === undefined) {
       try {
-        const answer = await deps.observability.observe(chain, deps.network)
+        const answer = await deps.availability.observe(chain, deps.network)
         observation = { observable: answer.observable, reason: answer.observable ? null : answer.reason }
       } catch {
         // An indexer that cannot be reached is `unknown`, never `unsupported`. Reporting a
@@ -489,6 +550,7 @@ export async function depositableAssets(
       chain,
       depositable: observation.observable,
       reason: observation.reason,
+      detail: observation.reason === null ? null : unobservableDetail(assetCode, observation.reason),
     })
   }
   return Object.freeze(out)

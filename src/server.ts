@@ -852,12 +852,19 @@ function buildRoutes(): Route[] {
     }),
 
     /**
-     * What this deployment can take a deposit in, right now.
+     * What this deployment can take a deposit in, right now — **and what it cannot, and why.**
      *
      * Read-scope and not user-specific: the answer is a property of the estate, not of an account.
      * It exists so a client never has to guess — Receive used to build its menu from the caller's
      * HOLDINGS, which made a new asset unreachable, because you could only receive what you already
      * had.
+     *
+     * Every asset in `ON_CHAIN_ASSETS` is listed, including the ones on offer nowhere: a row carries
+     * `depositable`, the machine word `reason`, and since micro-org#481 a `detail` sentence that is
+     * the SAME string `POST /v1/deposits` raises as its 503 message for that asset. A consumer that
+     * drops the refused rows — `hub-web` filters on `depositable` — is why the owner reported seeing
+     * no Dogecoin anywhere in the wallet while this route had been answering with a DOGE row all
+     * along. `detail` exists so rendering that row costs a client no prose of its own.
      */
     route('GET', '/v1/deposits/assets', async (ctx, deps) => {
       await authenticate(ctx, deps, READ_SCOPE)

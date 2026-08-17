@@ -718,6 +718,10 @@ export function harness(
       indexer,
       ledger,
       observability: indexerObservability({ indexer, ttlMs: 0 }),
+      // The harness quotes no fees and gates on nothing, so the catalogue port is the same
+      // observation as the gate. A test that wants the two to DISAGREE — which is the whole of
+      // micro-org#481 — builds them itself; see `observability.test.ts` and `deposits.test.ts`.
+      availability: indexerObservability({ indexer, ttlMs: 0 }),
     },
     withdrawals: {
       sql: db,
