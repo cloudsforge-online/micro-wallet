@@ -27,7 +27,12 @@ import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring, type JobDeps } from './jobs.ts'
 import { buildUpstreams } from './upstreams.ts'
 import { staticFeeQuoter } from './settlement.ts'
-import { indexerObservability, payableChainsOnly, payableFromFeeQuotes } from './observability.ts'
+import {
+  chainAvailability,
+  indexerObservability,
+  payableChainsOnly,
+  payableFromFeeQuotes,
+} from './observability.ts'
 import {
   pendingCreditCount,
   sampleDepositAddressMetrics,
@@ -187,6 +192,16 @@ logger[payableOut.chains.length === 0 ? 'warn' : 'info']('deposit gate', {
     'because a withdrawal of its native asset could not be priced — WALLET_FEE_QUOTES',
 })
 
+/**
+ * One indexer-backed observation port, shared by the deposit gate and the deposit catalogue.
+ *
+ * Shared rather than constructed twice because the 60-second cache lives inside it: two instances
+ * would hold two independently-ageing answers to one question, and `POST /v1/deposits` refusing an
+ * asset that `GET /v1/deposits/assets` had just offered — for no reason either could name — is the
+ * exact class of disagreement this whole file is arranged to avoid.
+ */
+const chainObservability = indexerObservability({ indexer })
+
 const deposits: DepositDeps = {
   sql: db,
   producer: SERVICE,
@@ -204,7 +219,20 @@ const deposits: DepositDeps = {
   // reaches the indexer at all, so switching a chain on in `INDEXER_CHAINS` cannot open deposits
   // as a side effect of a decision that was about something else.
   observability: payableChainsOnly({
-    observability: indexerObservability({ indexer }),
+    observability: chainObservability,
+    payable: payableOut.payable,
+  }),
+  // The same two questions for the CATALOGUE, which describes rather than gates — micro-org#481.
+  // Identical verdict, and it asks the indexer even about a chain the fee table has already closed,
+  // so `GET /v1/deposits/assets` can say "nothing here follows Dogecoin" instead of "we follow
+  // Dogecoin and cannot pay it out", which is what the short-circuiting gate above had it saying
+  // about four of this estate's eight assets.
+  //
+  // ONE shared `indexerObservability` deliberately: it holds the 60-second cache, so the catalogue
+  // and the gate answer from the same observation rather than from two that can differ, and the
+  // extra chains cost at most one round trip each per TTL.
+  availability: chainAvailability({
+    observability: chainObservability,
     payable: payableOut.payable,
   }),
 }
