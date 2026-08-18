@@ -93,6 +93,7 @@ import {
   type LedgerEntry,
   type PostingRequest,
 } from './ledgerclient.ts'
+import type { Metrics } from '@cloudsforge/telemetry'
 import { CONVERSION_COMPLETED, writeEvent, type Db, type DomainEvent } from './outbox.ts'
 import { RateUnavailableError, type PricingClient } from './pricingclient.ts'
 
@@ -782,6 +783,63 @@ export async function deskInventory(deps: MoneyDeps): Promise<readonly DeskInven
       amount: amount.toString(),
       amountFormatted: formatDisplay(assetCode, amount),
     }))
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * PUBLISH WHAT THE DESK IS HOLDING, SO THAT RUNNING DRY IS SEEN BEFORE IT IS FELT.
+ *
+ * micro-org#501. `fundDesk` is `requireAdmin` and stays that way — the argument is in the issue and
+ * the short version is that both fundings this estate has booked drew on a USER's available
+ * balance, so a service principal able to call it would be a machine that can debit a user without
+ * that user's session. The gate is right. What was missing is that NOTHING observed the inventory:
+ * an empty desk produced no series, no alert and no log line, and the first party to learn of it
+ * would have been a person holding a 409.
+ *
+ * ── WHY THIS IS NOT THE DISCLOSURE `deskInventoryShort` REFUSES ────────────────────────────────
+ *
+ * That refusal hides the figure because an anonymous caller could otherwise buy a trading signal
+ * for the price of one request. This is the same number and a different audience. `/metrics` is
+ * bound to `127.0.0.1:<port>:4000` in the estate's compose file and carries no gateway route, so
+ * the only things that can read it are Prometheus on the container network and somebody already on
+ * the host. `deskInventory` above makes the identical trade for the identical reason and says so.
+ *
+ * **If wallet is ever given a public route, this series moves or the route excludes `/metrics`.**
+ *
+ * ── WHOLE UNITS, NOT THE SMALLEST UNIT ────────────────────────────────────────────────────────
+ *
+ * A Prometheus sample is a float64, and the desk's EMBER balance today is 2.84e22 wei — four
+ * orders of magnitude past the last integer a float64 can hold exactly. Exporting raw wei would
+ * publish a silently rounded number as the input to a threshold, which is the one job this series
+ * has. `formatAmount` is the same conversion the operator's own surface uses, so the gauge and the
+ * admin route cannot disagree about what is in the desk.
+ *
+ * ── AN ABSENT SERIES IS NOT A ZERO, AND THAT IS WHY THE COUNTER BESIDE IT EXISTS ──────────────
+ *
+ * This can only publish an asset the desk holds an account in. An asset it was never funded in at
+ * all has no balance row, so no series, so `wallet_desk_inventory < x` never fires for it — the
+ * silence looks identical to health. `ExchangeDeskInventoryShort` in `deploy/prometheus/rules/`
+ * alerts on the REFUSAL instead, which is emitted from the conversion route whether or not an
+ * account exists, and the two rules together cover both shapes.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function sampleDeskInventory(deps: MoneyDeps, metrics: Metrics): Promise<void> {
+  const held = await readDeskInventory(deps)
+  for (const [assetCode, amount] of held) {
+    metrics.set('wallet_desk_inventory', wholeUnits(assetCode, amount), { asset: assetCode })
+  }
+}
+
+/**
+ * An amount as a number of whole units, for a gauge and for nothing else.
+ *
+ * Every other reader of an amount in this file keeps it a `bigint` all the way to the ledger, and
+ * that is not negotiable — this is the one place a lossy conversion is correct, because the
+ * destination is a float64 either way and the choice is only whether the loss lands in the
+ * fractional digits or in the significant ones.
+ */
+function wholeUnits(assetCode: string, amount: bigint): number {
+  return Number(formatDisplay(assetCode, amount))
 }
 
 export interface FundDeskInput {

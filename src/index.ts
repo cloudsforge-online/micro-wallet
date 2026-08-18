@@ -39,7 +39,7 @@ import {
   tokenSightingCount,
   type DepositDeps,
 } from './deposits.ts'
-import type { MoneyDeps } from './money.ts'
+import { sampleDeskInventory, type MoneyDeps } from './money.ts'
 import type { PortfolioDeps } from './portfolio.ts'
 import type { WithdrawalDeps } from './withdrawals.ts'
 import type { Db } from './outbox.ts'
@@ -302,6 +302,16 @@ const server = createServer({
     // The argument for all of that is on the function; the short version is that a leased job was
     // publishing a batch-capped copy of one of them from one replica.
     await sampleDepositAddressMetrics(deposits, metrics)
+    // What the conversion desk is holding — micro-org#501. Nothing observed this before, so the
+    // desk could run to zero and the first party to find out would be a person holding a 409. The
+    // reason it is safe to publish here a figure the public route refuses is on the function, and
+    // it rests on `/metrics` being loopback-bound with no gateway route.
+    //
+    // LAST, and that is a decision. This is the only line in this hook that dials another service
+    // — the rest read this service's own database. `/metrics` catches a throw from here and serves
+    // the previous values, so a ledger outage costs this gauge its refresh either way; ordering it
+    // last means it cannot also cost the four gauges above theirs.
+    await sampleDeskInventory(money, metrics)
   },
 })
 

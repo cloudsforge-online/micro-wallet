@@ -385,6 +385,34 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['route', 'outcome'],
     })
+    /**
+     * What the conversion desk is holding, per asset — micro-org#501. Written from one place,
+     * `money.sampleDeskInventory`, called by `beforeScrape` in `index.ts`.
+     *
+     * **Whole units, not the smallest unit, and that is load-bearing.** A Prometheus sample is a
+     * float64 and the desk's EMBER balance is 2.84e22 wei — four orders of magnitude past the last
+     * integer a float64 holds exactly. A wei-valued gauge would silently round the input to a
+     * threshold. `formatAmount` is the same conversion the admin surface uses, so the gauge and
+     * that page cannot disagree about what is in the desk.
+     *
+     * **An absent series is not a zero.** This can only publish an asset the desk holds a balance
+     * row for, so an asset it was never funded in has no series at all and
+     * `wallet_desk_inventory < x` never fires for it. `ExchangeDeskInventoryShort` alerts on the
+     * REFUSAL instead — the `desk_short` outcome on the counter above, which is emitted whether or
+     * not an account exists — and the two rules together cover both shapes.
+     *
+     * Labelled by asset, unlike the two deposit gauges: the desk is per-asset by construction, the
+     * repair differs per asset (each one is funded separately), and the cardinality is the number
+     * of assets the desk trades, which is one.
+     */
+    .register({
+      name: 'wallet_desk_inventory',
+      help:
+        'Conversion desk inventory in whole units, per asset. Falling to 0 means conversions out ' +
+        'of that asset start being refused — see micro-org#501.',
+      kind: 'gauge',
+      labels: ['asset'],
+    })
 }
 
 const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
@@ -1071,6 +1099,30 @@ function buildRoutes(): Route[] {
           outcome: result.replayed ? 'replayed' : 'posted',
         })
         return { status: result.replayed ? 200 : 201, body: result }
+      } catch (err) {
+        /**
+         * micro-org#501. An empty desk was the ONE outcome of this route that nothing counted.
+         * `convert` throws `desk_inventory_short` before the increment above, so a desk that had
+         * run dry produced a 409 to the user and complete silence to the estate — no series moved,
+         * and `wallet_desk_inventory` cannot cover it either, because an asset the desk holds no
+         * account in has no balance row and therefore no series at all.
+         *
+         * Only this one code is caught and re-thrown. A blanket `outcome: 'failed'` here would fold
+         * a user's own shortfall, a bad asset code and a pricing outage into the series an operator
+         * would page on, and the alert would then fire for four reasons with one repair listed.
+         *
+         * The ASSET is not a label. Which asset the desk is out of is the same trading signal the
+         * 409's wording withholds, and `/metrics` is only unpublished today — one gateway route
+         * away from being the disclosure the refusal refuses. The operator learns which asset from
+         * `wallet_desk_inventory` and from the admin route, both of which are already gated.
+         */
+        if (err instanceof MoneyError && err.code === 'desk_inventory_short') {
+          deps.metrics.increment('wallet_money_operations_total', {
+            route: 'conversion',
+            outcome: 'desk_short',
+          })
+        }
+        throw err
       } finally {
         done()
       }

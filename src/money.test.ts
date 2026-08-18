@@ -21,9 +21,12 @@ import {
   listTransfers,
   quoteConversion,
   readConversion,
+  sampleDeskInventory,
   spend,
   transfer,
 } from './money.ts'
+import { Metrics, type DroppedMetricWrite } from '@cloudsforge/telemetry'
+import { registerServiceMetrics } from './server.ts'
 import {
   enabled,
   harness,
@@ -790,6 +793,105 @@ test('the inventory read reports every asset the desk holds, formatted', { skip 
     { assetCode: 'EMBER', amount: '3000000000000000000', amountFormatted: '3' },
     { assetCode: 'SHARD', amount: '1000', amountFormatted: '1000' },
   ])
+})
+
+/* ------------------------------------------------------------------ the desk, at scrape time */
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#501. NOTHING IN THE ESTATE COULD SEE THE DESK RUN OUT.
+ *
+ * The refusal above is correct and it is also the ONLY signal that existed: `convert` threw
+ * `desk_inventory_short` before the route's counter ran, so a dry desk produced a 409 to one user
+ * and complete silence to everyone else. No gauge, no counter, no log line an operator would find.
+ * The first party to learn the desk was empty would have been the person holding the 409, and the
+ * desk cannot refill itself — `fundDesk` is `requireAdmin` and stays that way, because both
+ * fundings this estate has booked drew on a USER's available balance.
+ *
+ * These tests are about the gauge meaning what the alert thinks it means, in the same sense
+ * `depositmetrics.test.ts` is: a series that rounds, or that vanishes when the news is worst, is
+ * worse than no series, because it reads as cover.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** The value of one `asset`-labelled series, or `null` when the scrape would not contain it. */
+function deskSeries(metrics: Metrics, asset: string): number | null {
+  const prefix = `wallet_desk_inventory{asset="${asset}"}`
+  const line = metrics
+    .render()
+    .split('\n')
+    .find((l) => l.startsWith(prefix))
+  return line === undefined ? null : Number(line.slice(line.lastIndexOf(' ') + 1))
+}
+
+const scrape = async (): Promise<Metrics> => {
+  const metrics = registerServiceMetrics(new Metrics())
+  await sampleDeskInventory(h.money, metrics)
+  return metrics
+}
+
+test('a scrape publishes what the desk holds, per asset', { skip }, async () => {
+  h.ledger.seedDesk('SHARD', 1_000n)
+  h.ledger.seedDesk('EMBER', 3n * ONE_EMBER)
+  // Not stock: the same rule `deskInventory` follows. Counting an `available` balance under the
+  // `exchange` subject as inventory would publish a number the desk cannot actually sell out of,
+  // and an alert on it would go quiet for the wrong reason.
+  h.ledger.credit('exchange', 'BTC', 500n)
+
+  const metrics = await scrape()
+  assert.equal(deskSeries(metrics, 'EMBER'), 3)
+  assert.equal(deskSeries(metrics, 'SHARD'), 1000)
+  assert.equal(deskSeries(metrics, 'BTC'), null)
+})
+
+test('THE RULE: the gauge is whole units, because a wei-valued sample is a rounded one', { skip }, async () => {
+  /*
+   * The mainnet desk held 28,432.78 EMBER when this was written. A Prometheus sample is a float64
+   * and that balance is 2.843278e22 wei — four orders of magnitude past 2^53, the last integer a
+   * float64 holds exactly. Exporting the smallest unit would publish a silently rounded number as
+   * the input to a threshold, which is the one job this series has.
+   *
+   * The second assertion is the defect itself rather than the fix: it is what the series would have
+   * carried, and it is not the balance.
+   */
+  const wei = 28_432_780_000_000_000_000_000n
+  h.ledger.seedDesk('EMBER', wei)
+
+  assert.equal(deskSeries(await scrape(), 'EMBER'), 28_432.78)
+  assert.notEqual(BigInt(Number(wei)), wei, 'if this ever passes, float64 has changed and so can we')
+})
+
+test('THE RULE: an asset the desk never held publishes nothing, so absent is not a zero', { skip }, async () => {
+  /*
+   * There is no balance row for an asset the desk was never funded in, so there is no series, so
+   * `wallet_desk_inventory < x` never fires for it and the silence is indistinguishable from
+   * health. This is asserted rather than left implicit because it is the entire reason
+   * `ExchangeDeskInventoryShort` alerts on the REFUSAL counter instead of on this gauge: the
+   * conversion route increments `outcome="desk_short"` whether or not an account exists.
+   *
+   * The opposite choice — publishing 0 for every asset in the catalogue, as the deposit gauges do
+   * per chain — is wrong here. A chain list is fixed by the build; which assets the desk is meant
+   * to trade is a business decision nothing in this service holds, so a fabricated 0 would page the
+   * operator about a desk they never intended to open.
+   */
+  h.ledger.seedDesk('EMBER', 5n * ONE_EMBER)
+  const metrics = await scrape()
+  assert.equal(deskSeries(metrics, 'EMBER'), 5)
+  assert.equal(deskSeries(metrics, 'LTC'), null)
+  assert.doesNotMatch(metrics.render(), /wallet_desk_inventory\{asset="LTC"\}/)
+})
+
+test('THE RULE: the series name is registered, or every write is dropped in silence', { skip }, async () => {
+  // `Metrics.set` on an unregistered name reports and returns — it does not throw — so a sampler
+  // wired to a name nobody registered scrapes clean for ever. That is how a gauge gets deployed
+  // and alerted on without existing. The registry is the thing under test here, not the sampler.
+  const dropped: DroppedMetricWrite[] = []
+  const metrics = registerServiceMetrics(new Metrics({ onDropped: (d) => dropped.push(d) }))
+  h.ledger.seedDesk('EMBER', ONE_EMBER)
+
+  await sampleDeskInventory(h.money, metrics)
+  assert.deepEqual(dropped, [], 'a dropped write means the name or the label is unregistered')
+  assert.match(metrics.render(), /# TYPE wallet_desk_inventory gauge/)
 })
 
 /* ------------------------------------------------------------------ the quote */
