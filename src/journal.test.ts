@@ -92,7 +92,7 @@ const MONEY_PATHS: ReadonlyArray<{ file: string; fn: string; why: string }> = [
   {
     file: 'money.ts',
     fn: 'run',
-    why: 'the shared path behind /v1/spend, /v1/transfers and /v1/conversions — each a user act carrying an idempotency key',
+    why: 'the shared path behind /v1/spend, /v1/transfers, /v1/conversions and the exchange desk’s funding route — each an act carrying an idempotency key',
   },
   {
     file: 'withdrawals.ts',

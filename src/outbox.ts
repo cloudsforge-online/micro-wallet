@@ -100,6 +100,26 @@ export const DEPOSIT_TOKEN_UNCREDITED = 'wallet.deposit.token_uncredited'
 export const WITHDRAWAL_REQUESTED = 'wallet.withdrawal.requested'
 export const WITHDRAWAL_REFUNDED = 'wallet.withdrawal.refunded'
 export const WITHDRAWAL_STUCK = 'wallet.withdrawal.stuck'
+/**
+ * A user swapped one asset for another — micro-org#495 §4.
+ *
+ * **The category it feeds has existed with nothing producing into it.** `activity/src/categories.ts`
+ * has listed `conversion` since that service was written and no topic was ever classified into it,
+ * so a user who converted one coin into another — often the largest thing they did that day — read
+ * a feed that did not mention it and a filter tab that was always empty.
+ *
+ * Registered in `contracts-events` BEFORE this emit existed, which is not optional and this file's
+ * header says why: `validateEnvelope` refuses an unregistered name and `createRelay` quarantines on
+ * exactly that verdict, so an emit added first writes rows nothing can publish. micro-contracts#15
+ * registered it; micro-activity classifies it; micro-notify has recorded, in writing, that it does
+ * NOT notify — the user pressed convert and read the answer in the same request, so there is no
+ * news in it and nobody else to tell.
+ *
+ * Keyed by the LEDGER ENTRY id, which is the registry's `keyed_by: entry_id`, and which is the
+ * conversion's whole identity: this service keeps no conversions table, and the same id is what
+ * `GET /v1/conversions/:id` takes.
+ */
+export const CONVERSION_COMPLETED = 'wallet.conversion.completed'
 
 /** The topics this service consumes. Both come from the indexer — see indexer/src/outbox.ts. */
 export const INDEXER_DEPOSIT_CONFIRMED = 'indexer.deposit.confirmed'

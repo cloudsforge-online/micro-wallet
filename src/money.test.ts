@@ -12,7 +12,18 @@ import {
   requireIdempotencyKey,
   withIdempotency,
 } from './idempotency.ts'
-import { MoneyError, convert, spend, transfer } from './money.ts'
+import {
+  MoneyError,
+  convert,
+  deskInventory,
+  fundDesk,
+  listConversions,
+  listTransfers,
+  quoteConversion,
+  readConversion,
+  spend,
+  transfer,
+} from './money.ts'
 import {
   enabled,
   harness,
@@ -29,6 +40,7 @@ let h: Harness
 
 const USER = testUser(1)
 const OTHER = testUser(2)
+const ADMIN = testUser(3)
 const ONE_EMBER = 1_000_000_000_000_000_000n
 
 before(async () => {
@@ -288,6 +300,7 @@ test('a SHARD holder can still convert out, because the guard permits conversion
    * which is the property a careless tightening of the guard would break silently.
    */
   h.ledger.credit(`user:${USER}`, 'SHARD', 1_000n)
+  h.ledger.seedDesk('EMBER', 10n * ONE_EMBER)
   const result = await convert(h.money, {
     userId: USER,
     fromAssetCode: 'SHARD',
@@ -421,6 +434,7 @@ test('a conversion posts two balanced pairs, one per asset', { skip }, async () 
   // `balanceEntry` requires Σ debits = Σ credits PER ASSET, so a conversion cannot be two
   // postings: each asset needs its own counter-account.
   h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 1_000n)
   const result = await convert(h.money, {
     userId: USER,
     fromAssetCode: 'EMBER',
@@ -434,11 +448,17 @@ test('a conversion posts two balanced pairs, one per asset', { skip }, async () 
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 8n * ONE_EMBER)
   // 2 EMBER at $2.50 = $5.00 = 500 Shards, at 100 Shards per USD.
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 500n)
-  // The clearing account holds both sides. A non-zero clearing balance is the first thing
-  // reconciliation looks at, and here it is exactly the coin taken in exchange for the Shards
-  // issued — if the two stop corresponding, something is minting.
-  assert.equal(h.ledger.balanceOf('clearing', 'EMBER', 'available'), 2n * ONE_EMBER)
-  assert.equal(h.ledger.balanceOf('clearing', 'SHARD', 'available'), -500n)
+  /*
+   * BOTH COUNTER-LEGS ARE THE DESK, AND THE SHARD SIDE GOES DOWN RATHER THAN NEGATIVE.
+   *
+   * These two assertions used to name `clearing` and expect the Shard side to sit at -500 — "the
+   * Shard side goes negative by construction" was the design, and it was a mint: `clearing` is
+   * exempt from the ledger's overdraft trigger, so the platform could issue any number of Shards it
+   * did not hold. The desk is an `equity`/`inventory` account instead, it was funded with 1,000
+   * above, and what is left is what it can still sell.
+   */
+  assert.equal(h.ledger.balanceOf('exchange', 'EMBER', 'inventory'), 2n * ONE_EMBER)
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 500n)
   assert.equal(result.summary['toAmount'], '500')
 })
 
@@ -447,6 +467,7 @@ test('a conversion rounds down, never up', { skip }, async () => {
   // growing, invisible liability. Rounding down leaves dust on the coin side, which
   // reconciliation can see. 0.0079 EMBER at $2.50 is $0.01975, which is 1.975 Shards.
   h.ledger.credit(`user:${USER}`, 'EMBER', ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 1_000n)
   const result = await convert(h.money, {
     userId: USER,
     fromAssetCode: 'EMBER',
@@ -461,7 +482,9 @@ test('a conversion rounds down, never up', { skip }, async () => {
 
 test('a conversion that would credit nothing is refused, not performed', { skip }, async () => {
   // Taking the input and crediting zero is not a rounding error, it is a confiscation.
+  // The desk is funded, so this is the rounding refusal rather than an empty-desk one.
   h.ledger.credit(`user:${USER}`, 'EMBER', ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 1_000n)
   await assert.rejects(
     () =>
       convert(h.money, {
@@ -483,6 +506,7 @@ test('a retried conversion replays without re-pricing', { skip }, async () => {
   // moved market, and the ledger — which fingerprints the whole body — would answer the legitimate
   // retry with 409 `idempotency_key_reuse`.
   h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 1_000n)
   const input = {
     userId: USER,
     fromAssetCode: 'EMBER',
@@ -504,6 +528,7 @@ test('a retried conversion replays without re-pricing', { skip }, async () => {
 test('an asset with no usable price refuses the conversion rather than guessing', { skip }, async () => {
   // A fallback rate is a rate at which somebody trades.
   h.ledger.credit(`user:${USER}`, 'BTC', 100_000_000n)
+  h.ledger.seedDesk('SHARD', 1_000n)
   await assert.rejects(
     () =>
       convert(h.money, {
@@ -533,4 +558,390 @@ test('an asset cannot be converted into itself', { skip }, async () => {
       }),
     (err: unknown) => err instanceof MoneyError && err.code === 'same_asset',
   )
+})
+
+/* ------------------------------------------------------------------ the desk can run out */
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#495 §1. THE OLD COUNTER-ACCOUNT COULD NOT REFUSE ANYTHING.
+ *
+ * Both conversion counter-legs used to be `clearing(asset)`, and `ledger_assert_no_overdraft()`
+ * returns *allow* for `type = 'clearing'` before it ever reads `overdraft_allowed`. So a user
+ * converting into EMBER was credited EMBER out of an account with no EMBER in it and the platform
+ * owed a coin it had never held. The desk is `equity`/`inventory`, which reaches the check.
+ *
+ * Every test below asserts on the JOURNAL and not only on the exception. "It answered 409" is
+ * satisfied by a refusal that happens after the user has already been debited, and the whole point
+ * of moving the guard into the entry's own transaction is that no such state exists.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+const CONVERT_INPUT = {
+  userId: USER,
+  fromAssetCode: 'EMBER',
+  toAssetCode: 'SHARD',
+  amount: 2n * ONE_EMBER,
+  clientKey: 'convert-key-1',
+  correlationId: 'req-1',
+  actor: `user:${USER}`,
+} as const
+
+test('THE RULE: an empty desk refuses the conversion and posts nothing', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  // No `seedDesk`. This is the estate on the day the desk is created and before anyone funds it.
+  await assert.rejects(
+    () => convert(h.money, CONVERT_INPUT),
+    (err: unknown) =>
+      err instanceof MoneyError && err.code === 'desk_inventory_short' && err.status === 409,
+  )
+  assert.equal(h.ledger.entries.length, 0, 'the journal must have no entry at all')
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 10n * ONE_EMBER)
+  assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 0n)
+})
+
+test('a conversion bigger than the desk holds is refused, and posts nothing', { skip }, async () => {
+  // Funded, but not enough: 2 EMBER at $2.50 wants 500 Shards and the desk has 100. This is the
+  // half of the pre-check that can only run AFTER pricing — the size of the order in the OUTPUT
+  // asset does not exist until the output amount does.
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 100n)
+  await assert.rejects(
+    () => convert(h.money, CONVERT_INPUT),
+    (err: unknown) => err instanceof MoneyError && err.code === 'desk_inventory_short',
+  )
+  assert.equal(h.ledger.entries.length, 0)
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 100n)
+})
+
+test('THE RULE: the refusal never discloses what the desk holds', { skip }, async () => {
+  /*
+   * What the desk is holding is a trading signal — it is what somebody would need in order to size
+   * an order against the platform's book — so an anonymous 409 must not publish it. The two ways in
+   * are also worded IDENTICALLY, because a caller who could tell "empty" from "not enough" could
+   * binary-search the inventory out of the difference, which is the same disclosure by a slower
+   * route.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  const empty = await convert(h.money, CONVERT_INPUT).catch((err: unknown) => err)
+
+  h = harness(sql)
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 137n)
+  const short = await convert(h.money, CONVERT_INPUT).catch((err: unknown) => err)
+
+  assert.ok(empty instanceof MoneyError && short instanceof MoneyError)
+  assert.equal(empty.message, short.message, 'empty and short must be indistinguishable')
+  assert.match(empty.message, /SHARD/, 'the ASSET is named — a person must know which side is short')
+  assert.doesNotMatch(short.message, /137|100|\b0\b/, 'the FIGURE must not appear')
+})
+
+test('a desk emptied inside the race window still loses cleanly', { skip }, async () => {
+  /*
+   * The pre-check is a read-then-write over the network and is therefore not the guarantee: another
+   * conversion can empty the desk between it and the posting. The guarantee is the ledger's
+   * `overdraft_allowed = false` check, inside the entry's transaction, with the balance row locked
+   * — and this asserts the loser of that race gets the SAME answer as everyone else rather than a
+   * raw constraint violation.
+   *
+   * The window is simulated at the only place it exists: the desk is drained in `postEntry`, after
+   * `convert` has read the inventory and decided it could be filled.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 500n)
+  const racing = {
+    ...h.ledger,
+    postEntry(request: Parameters<typeof h.ledger.postEntry>[0]) {
+      h.ledger.seedDesk('SHARD', -400n)
+      return h.ledger.postEntry(request)
+    },
+  }
+
+  await assert.rejects(
+    () => convert({ ...h.money, ledger: racing }, CONVERT_INPUT),
+    (err: unknown) => err instanceof MoneyError && err.code === 'desk_inventory_short',
+  )
+  assert.equal(h.ledger.entries.length, 0)
+})
+
+test('THE RULE: a user’s own shortfall is not reported as the desk’s', { skip }, async () => {
+  /*
+   * `insufficient_funds` is one ledger code for two opposite facts. The user cannot afford the
+   * INPUT leg here — the desk is fully funded — and telling them "the desk is out of SHARD" would
+   * send them away to try again later over a balance that is never going to be enough. The `subject`
+   * on the ledger's refusal is what separates the two, which is why it was added to micro-ledger
+   * rather than recovered by matching English.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  await assert.rejects(
+    () => convert(h.money, CONVERT_INPUT),
+    (err: unknown) =>
+      err instanceof LedgerRefusedError &&
+      err.code === 'insufficient_funds' &&
+      err.subject === `user:${USER}`,
+  )
+  assert.equal(h.ledger.entries.length, 0)
+})
+
+/* ------------------------------------------------------------------ funding the desk */
+
+const FUND = {
+  adminUserId: ADMIN,
+  sourceAccount: `user:${OTHER}`,
+  assetCode: 'SHARD',
+  amount: 1_000n,
+  reason: 'seeding the SHARD book',
+  direction: 'in',
+  clientKey: 'fund-key-1',
+  correlationId: 'req-1',
+  actor: `user:${ADMIN}`,
+} as const
+
+test('funding the desk moves stock into it under liquidity_seed', { skip }, async () => {
+  h.ledger.credit(`user:${OTHER}`, 'SHARD', 5_000n)
+  const result = await fundDesk(h.money, FUND)
+
+  assert.equal(result.replayed, false)
+  assert.equal(h.ledger.entries.at(-1)!.kind, 'liquidity_seed', 'a kind that already existed')
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 1_000n)
+  assert.equal(h.ledger.balanceOf(`user:${OTHER}`, 'SHARD', 'available'), 4_000n)
+  assert.equal(result.summary['direction'], 'in')
+})
+
+test('THE RULE: a funding is reversible by the same route', { skip }, async () => {
+  /*
+   * §2 requires the entry to be reversible by a negative-direction sibling rather than by a second
+   * route or by hand-written SQL. `direction` is that sibling, and it is in the idempotency
+   * fingerprint: funding and its reversal are the same amount, asset and account, so a key that
+   * could not tell them apart would answer the reversal with the funding's entry and report money
+   * as moved back when it had not.
+   */
+  h.ledger.credit(`user:${OTHER}`, 'SHARD', 5_000n)
+  await fundDesk(h.money, FUND)
+  const back = await fundDesk(h.money, {
+    ...FUND,
+    direction: 'out',
+    reason: 'wrong amount, putting it back',
+    clientKey: 'fund-key-2',
+  })
+
+  assert.equal(back.replayed, false)
+  assert.equal(h.ledger.entries.length, 2, 'two entries, not one replayed')
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 0n)
+  assert.equal(h.ledger.balanceOf(`user:${OTHER}`, 'SHARD', 'available'), 5_000n)
+})
+
+test('a drawdown larger than the desk holds is refused', { skip }, async () => {
+  // The desk being non-exempt cuts both ways: a reversal cannot leave the inventory negative
+  // either, so a fat-fingered drawdown is refused rather than silently overdrawing the book.
+  h.ledger.seedDesk('SHARD', 100n)
+  await assert.rejects(
+    () => fundDesk(h.money, { ...FUND, direction: 'out' }),
+    (err: unknown) =>
+      err instanceof LedgerRefusedError &&
+      err.code === 'insufficient_funds' &&
+      err.subject === 'exchange',
+  )
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 100n)
+})
+
+test('funding out of a treasury that holds nothing is refused', { skip }, async () => {
+  /*
+   * **Funding does not CREATE stock**, and this is the assertion that says so. `platform`'s
+   * treasury is an `equity` account and equity is not overdraft-exempt either, so a treasury that
+   * has never held SHARD cannot seed a SHARD desk. It is the correct refusal — a desk funded out of
+   * an empty account is the same unbacked liability one account further back — and it does mean a
+   * cold estate has to put the asset in the treasury first. That is recorded on micro-org#495.
+   */
+  await assert.rejects(
+    () => fundDesk(h.money, { ...FUND, sourceAccount: 'platform' }),
+    (err: unknown) =>
+      err instanceof LedgerRefusedError &&
+      err.code === 'insufficient_funds' &&
+      err.subject === 'platform',
+  )
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 0n)
+})
+
+test('a misspelt source account is refused rather than opened', { skip }, async () => {
+  // The ledger CREATES an account it has not seen. A typo therefore does not fail: it opens a
+  // permanent account with a misspelt name and moves real money into a place no route can spend it
+  // out of. A uuid check is the difference between a 422 and a manual correction entry.
+  for (const sourceAccount of ['user:not-a-uuid', 'platfrom', 'treasury']) {
+    await assert.rejects(
+      () => fundDesk(h.money, { ...FUND, sourceAccount }),
+      (err: unknown) =>
+        err instanceof MoneyError && err.code === 'unknown_source' && err.status === 422,
+    )
+  }
+  assert.equal(h.ledger.entries.length, 0)
+})
+
+test('the inventory read reports every asset the desk holds, formatted', { skip }, async () => {
+  // The figure IS returned here, and that is not in tension with the refusal hiding it: this backs
+  // a `requireAdmin` route, and an operator deciding whether to fund the desk has to see what is in
+  // it. `available` under the same subject is deliberately not counted as stock.
+  h.ledger.seedDesk('SHARD', 1_000n)
+  h.ledger.seedDesk('EMBER', 3n * ONE_EMBER)
+  h.ledger.credit('exchange', 'BTC', 500n)
+
+  assert.deepEqual(await deskInventory(h.money), [
+    { assetCode: 'EMBER', amount: '3000000000000000000', amountFormatted: '3' },
+    { assetCode: 'SHARD', amount: '1000', amountFormatted: '1000' },
+  ])
+})
+
+/* ------------------------------------------------------------------ the quote */
+
+test('a quote gives the conversion’s figures and books nothing', { skip }, async () => {
+  const quote = await quoteConversion(h.money, {
+    fromAssetCode: 'ember',
+    toAssetCode: 'shard',
+    amount: 2n * ONE_EMBER,
+  })
+
+  assert.equal(quote.fromAssetCode, 'EMBER')
+  assert.equal(quote.toAmount, '500')
+  assert.equal(quote.toAmountFormatted, '500')
+  assert.equal(quote.fromAmountFormatted, '2')
+  assert.equal(h.ledger.entries.length, 0, 'a quote is not a conversion')
+})
+
+test('THE RULE: a quote says in the payload that it is not a hold', { skip }, async () => {
+  // In a FIELD, not in prose only the API docs carry. Nothing is reserved by asking: the rate can
+  // move and somebody else can spend the inventory in the same window. A surface that renders a
+  // quote as a hold is making a promise this service has not made, and the only way to stop that
+  // being an easy mistake is to put the disclaimer in the payload it is already rendering.
+  const quote = await quoteConversion(h.money, {
+    fromAssetCode: 'EMBER',
+    toAssetCode: 'SHARD',
+    amount: ONE_EMBER,
+  })
+  assert.equal(quote.hold, false)
+  assert.match(quote.holdNotice, /not a hold/i)
+})
+
+test('a quote does not answer whether the desk could fill it', { skip }, async () => {
+  /*
+   * The desk is deliberately NOT consulted here. An unlimited, free, unbooked route that answers
+   * "can you fill N?" is an oracle: a caller binary-searches N and reads the inventory straight out
+   * of it — the figure `desk_inventory_short` exists not to disclose. So an unfillable amount is
+   * quoted like any other and refused at the conversion, which costs one request.
+   */
+  const quote = await quoteConversion(h.money, {
+    fromAssetCode: 'EMBER',
+    toAssetCode: 'SHARD',
+    amount: 1_000n * ONE_EMBER,
+  })
+  assert.equal(quote.toAmount, '250000')
+  assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 0n)
+})
+
+/* ------------------------------------------------------------------ reading them back */
+
+test('conversions are read out of the journal, newest first, and page', { skip }, async () => {
+  /*
+   * micro-org#495 §3, and the reason there is no conversions table: the entry IS the conversion.
+   * A wallet-side copy would be a second record of the same fact, written in a second transaction,
+   * free to disagree with the first — and invisibly, because the surface would read the copy.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  for (const key of ['c1', 'c2', 'c3']) {
+    await convert(h.money, { ...CONVERT_INPUT, amount: ONE_EMBER, clientKey: key })
+  }
+
+  const first = await listConversions(h.money, { userId: USER, limit: 2 })
+  assert.equal(first.conversions.length, 2)
+  assert.equal(first.conversions[0]!.fromAssetCode, 'EMBER')
+  assert.equal(first.conversions[0]!.toAmount, '250')
+  assert.equal(first.conversions[0]!.fromAmountFormatted, '1')
+  assert.ok(first.nextCursor, 'a full page with more behind it carries a cursor')
+
+  const second = await listConversions(h.money, {
+    userId: USER,
+    limit: 2,
+    cursor: first.nextCursor!,
+  })
+  assert.equal(second.conversions.length, 1)
+  assert.equal(second.nextCursor, null, 'null on the last page — callers page until null')
+  const ids = [...first.conversions, ...second.conversions].map((c) => c.id)
+  assert.equal(new Set(ids).size, 3, 'no entry appears on two pages')
+})
+
+test('THE RULE: another user’s conversion reads as absent, not as forbidden', { skip }, async () => {
+  /*
+   * Fail-closed in all three directions — not this service's entry, not a conversion, not this
+   * user's — and to the SAME `null` a nonexistent id gets. A caller who could tell "somebody else's
+   * conversion" from "no such conversion" would have an oracle for entry ids.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  const posted = await convert(h.money, CONVERT_INPUT)
+
+  const mine = await readConversion(h.money, { userId: USER, entryId: posted.entryId })
+  assert.equal(mine?.id, posted.entryId)
+  assert.equal(mine?.rateScale, '1000000')
+
+  assert.equal(await readConversion(h.money, { userId: OTHER, entryId: posted.entryId }), null)
+  assert.equal(await readConversion(h.money, { userId: USER, entryId: 'entry-999' }), null)
+})
+
+test('transfers read back from both ends of the entry', { skip }, async () => {
+  // The ledger's subject filter is an ENTRY-level filter, so an entry with a posting against this
+  // user comes back whichever end that posting is. A "transfers" list showing only what somebody
+  // had sent would be a strange thing to hand a person looking for money a friend says they sent.
+  h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  h.ledger.credit(`user:${OTHER}`, 'SHARD', 500n)
+  await transfer(h.money, {
+    userId: USER,
+    toUserId: OTHER,
+    assetCode: 'SHARD',
+    amount: 200n,
+    clientKey: 'out-1',
+    correlationId: 'r',
+    actor: `user:${USER}`,
+  })
+  await transfer(h.money, {
+    userId: OTHER,
+    toUserId: USER,
+    assetCode: 'SHARD',
+    amount: 50n,
+    clientKey: 'in-1',
+    correlationId: 'r',
+    actor: `user:${OTHER}`,
+  })
+
+  const page = await listTransfers(h.money, { userId: USER, limit: 10 })
+  assert.deepEqual(
+    page.transfers.map((t) => [t.direction, t.amount, t.counterpartyUserId]),
+    [
+      ['in', '50', OTHER],
+      ['out', '200', OTHER],
+    ],
+  )
+  assert.equal(page.nextCursor, null)
+})
+
+test('a conversion emits into the empty activity category', { skip }, async () => {
+  /*
+   * micro-org#495 §4. `activity/src/categories.ts` has listed `conversion` since that service was
+   * written and nothing has ever produced into it, so a user who swapped one coin for another read
+   * a feed that did not mention it. The row is written inside `withIdempotency`'s transaction, so
+   * the event and the stored response commit together — a publish after commit is a publish that is
+   * skipped when the process dies in between.
+   */
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  const posted = await convert(h.money, CONVERT_INPUT)
+
+  const rows = await sql<
+    Array<{ topic: string; key: string; payload: Record<string, unknown> }>
+  >`select topic, key, payload from outbox`
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.topic, 'wallet.conversion.completed')
+  assert.equal(rows[0]!.key, posted.entryId, 'keyed by the entry, which IS the conversion')
+  assert.equal(rows[0]!.payload['toAmountFormatted'], '500')
+  assert.equal(rows[0]!.payload['userId'], USER)
 })

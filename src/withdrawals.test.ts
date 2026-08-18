@@ -477,7 +477,10 @@ test('settlement consumes the reservation rather than releasing it', { skip }, a
   // left custody, so both must leave.
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'reserved'), 0n)
   assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 9n * ONE_EMBER)
-  assert.equal(h.ledger.balanceOf('custody', 'EMBER', 'available'), -AMOUNT)
+  // Custody held the 10 EMBER that backed the user's balance; the whole withdrawal has now left it.
+  // This used to assert `-AMOUNT`, which is a state the ledger's overdraft trigger will not hold —
+  // an `asset` account reaches the same check a liability does, and only the fake was lenient.
+  assert.equal(h.ledger.balanceOf('custody', 'EMBER', 'available'), 10n * ONE_EMBER - AMOUNT)
   assert.equal(SETTLEMENT_CONFIRMED, 'settlement.outbound.confirmed')
 })
 
