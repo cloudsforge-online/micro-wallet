@@ -37,6 +37,7 @@ const SECRET = 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4'
 const DOMAIN = 'hub.cloudsforge.online'
 const URI = 'https://hub.cloudsforge.online/wallets/verify'
 const USER = testUser(1)
+const ADMIN = testUser(9)
 const ONE_EMBER = 1_000_000_000_000_000_000n
 
 const keys = await generateKeyPair('RS256', { extractable: true })
@@ -71,12 +72,20 @@ const unreachableVerifier = () =>
 let sql: postgres.Sql
 let h: Harness
 let userToken: string
+let adminToken: string
 
 before(async () => {
   if (!enabled) return
   sql = openDb()
   await migrateTestDb(sql)
   userToken = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  /*
+   * An OPERATOR, and the same person: `requireAdmin` is `kind === 'user' && roles.includes('admin')`,
+   * so an admin bearer is a user bearer with one more role. It is minted from the same key set and
+   * the same issuer as `userToken` — nothing about the desk routes' gate is stubbed, and a test that
+   * signed an admin claim some other way would be proving something about the signer.
+   */
+  adminToken = await sign({ sub: ADMIN, handle: 'operator', roles: ['player', 'admin'] })
 })
 
 after(async () => {
@@ -139,6 +148,12 @@ async function withServer(
 
 const asUser = (extra: Record<string, string> = {}) => ({
   authorization: `Bearer ${userToken}`,
+  'content-type': 'application/json',
+  ...extra,
+})
+
+const asAdmin = (extra: Record<string, string> = {}) => ({
+  authorization: `Bearer ${adminToken}`,
   'content-type': 'application/json',
   ...extra,
 })
@@ -264,17 +279,25 @@ test('THE RULE: a spend with no idempotency key is 400, not a silent double-debi
 })
 
 test('every money route refuses a missing key, not just the obvious one', { skip }, async () => {
-  const routes: Array<[string, Record<string, unknown>]> = [
+  const routes: Array<[string, Record<string, unknown>, 'admin'?]> = [
     ['/v1/spend', { amount: '1', reason: 'x' }],
     ['/v1/transfers', { toUserId: testUser(2), assetCode: 'SHARD', amount: '1' }],
     ['/v1/conversions', { fromAssetCode: 'EMBER', toAssetCode: 'SHARD', amount: '1' }],
     ['/v1/withdrawals', { assetCode: 'EMBER', destination: '0x' + '11'.repeat(20), amount: '1' }],
+    // The desk's funding route is a money route like any other. It is admin-only, so it is asked
+    // with an admin bearer — a player would be 403 here and the assertion would say nothing about
+    // the key. The check must come BEFORE the posting, and this is what proves it does.
+    [
+      '/v1/admin/exchange-desk/funding',
+      { sourceAccount: 'platform', assetCode: 'SHARD', amount: '1', reason: 'x' },
+      'admin',
+    ],
   ]
   await withServer({}, async (rig) => {
-    for (const [path, body] of routes) {
+    for (const [path, body, who] of routes) {
       const res = await fetch(`${rig.url}${path}`, {
         method: 'POST',
-        headers: asUser(),
+        headers: who === 'admin' ? asAdmin() : asUser(),
         body: JSON.stringify(body),
       })
       assert.equal(res.status, 400, `${path} accepted a missing key`)
@@ -455,6 +478,251 @@ test('the ledger refusing is shown to the user; the ledger being down is a 503',
     })
     assert.equal(refused.status, 409)
     assert.equal(((await refused.json()) as { error: { code: string } }).error.code, 'insufficient_funds')
+  })
+})
+
+/* ------------------------------------------------------------------ the exchange desk */
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * micro-org#495. EVERY ONE OF THESE GOES THROUGH THE SOCKET.
+ *
+ * The unit tests in `money.test.ts` prove what the desk DOES; these prove what a client sees, which
+ * is a different thing and the one micro-org#496's surface is built against: the status code, the
+ * error code string, the field names in the body, and which bearer gets in. A test that called
+ * `fundDesk` directly would still pass if the route were never registered.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+const CONVERSION_BODY = { fromAssetCode: 'EMBER', toAssetCode: 'SHARD', amount: '2000000000000000000' }
+
+test('THE RULE: an unfunded desk answers 409 desk_inventory_short and posts nothing', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/conversions`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'convert-1' }),
+      body: JSON.stringify(CONVERSION_BODY),
+    })
+    assert.equal(res.status, 409)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    assert.equal(body.error.code, 'desk_inventory_short')
+    assert.match(body.error.message, /SHARD/)
+    // The figure is a trading signal and is not in the wire body anywhere.
+    assert.doesNotMatch(body.error.message, /\d/)
+
+    assert.equal(h.ledger.entries.length, 0, 'the journal must have no entry')
+    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'EMBER', 'available'), 10n * ONE_EMBER)
+  })
+})
+
+test('a funded desk fills the conversion, and the entry is readable back', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  await withServer({}, async (rig) => {
+    const made = await fetch(`${rig.url}/v1/conversions`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'convert-1' }),
+      body: JSON.stringify(CONVERSION_BODY),
+    })
+    assert.equal(made.status, 201)
+    const { entryId } = (await made.json()) as { entryId: string }
+
+    const list = await fetch(`${rig.url}/v1/conversions`, { headers: asUser() })
+    assert.equal(list.status, 200)
+    const page = (await list.json()) as {
+      conversions: Array<Record<string, unknown>>
+      nextCursor: string | null
+    }
+    assert.equal(page.conversions.length, 1)
+    assert.equal(page.nextCursor, null)
+    assert.deepEqual(page.conversions[0], {
+      id: entryId,
+      occurredAt: page.conversions[0]!['occurredAt'],
+      recordedAt: page.conversions[0]!['recordedAt'],
+      fromAssetCode: 'EMBER',
+      fromAmount: '2000000000000000000',
+      fromAmountFormatted: '2',
+      toAssetCode: 'SHARD',
+      toAmount: '500',
+      toAmountFormatted: '500',
+      rateScale: '1000000',
+      quotedAt: '2026-01-01T00:00:00.000Z',
+    })
+
+    const one = await fetch(`${rig.url}/v1/conversions/${entryId}`, { headers: asUser() })
+    assert.equal(one.status, 200)
+    assert.deepEqual(
+      ((await one.json()) as { conversion: { id: string } }).conversion.id,
+      entryId,
+    )
+  })
+})
+
+test('THE RULE: another user’s conversion is 404, never 403', { skip }, async () => {
+  // A 403 on an id that exists and a 404 on one that does not is an oracle for entry ids. Both
+  // answers are the same here, and `readConversion` cannot tell the two apart either.
+  h.ledger.credit(`user:${USER}`, 'EMBER', 10n * ONE_EMBER)
+  h.ledger.seedDesk('SHARD', 10_000n)
+  await withServer({}, async (rig) => {
+    const made = await fetch(`${rig.url}/v1/conversions`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'convert-1' }),
+      body: JSON.stringify(CONVERSION_BODY),
+    })
+    const { entryId } = (await made.json()) as { entryId: string }
+
+    // The admin bearer is a different USER, and a different user's conversion is simply absent.
+    const theirs = await fetch(`${rig.url}/v1/conversions/${entryId}`, { headers: asAdmin() })
+    assert.equal(theirs.status, 404)
+    assert.equal(
+      ((await theirs.json()) as { error: { code: string } }).error.code,
+      'conversion_not_found',
+    )
+    const missing = await fetch(`${rig.url}/v1/conversions/entry-999`, { headers: asUser() })
+    assert.equal(missing.status, 404)
+  })
+})
+
+test('transfers list from both ends of the entry', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'SHARD', 500n)
+  await withServer({}, async (rig) => {
+    const sent = await fetch(`${rig.url}/v1/transfers`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'transfer-1' }),
+      body: JSON.stringify({ toUserId: testUser(2), assetCode: 'SHARD', amount: '200' }),
+    })
+    assert.equal(sent.status, 201)
+
+    const list = await fetch(`${rig.url}/v1/transfers`, { headers: asUser() })
+    assert.equal(list.status, 200)
+    const page = (await list.json()) as {
+      transfers: Array<Record<string, unknown>>
+      nextCursor: string | null
+    }
+    assert.equal(page.transfers.length, 1)
+    assert.equal(page.transfers[0]!['direction'], 'out')
+    assert.equal(page.transfers[0]!['amount'], '200')
+    assert.equal(page.transfers[0]!['counterpartyUserId'], testUser(2))
+    assert.equal(page.nextCursor, null)
+  })
+})
+
+test('a quote needs no idempotency key and says in the body that it is not a hold', { skip }, async () => {
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/conversions/quote`, {
+      method: 'POST',
+      headers: asUser(),
+      body: JSON.stringify(CONVERSION_BODY),
+    })
+    assert.equal(res.status, 200)
+    const { quote } = (await res.json()) as { quote: Record<string, unknown> }
+    assert.equal(quote['toAmount'], '500')
+    assert.equal(quote['toAmountFormatted'], '500')
+    assert.equal(quote['rateScale'], '1000000')
+    // In a FIELD the surface renders, not in prose only the API docs carry.
+    assert.equal(quote['hold'], false)
+    assert.match(String(quote['holdNotice']), /not a hold/i)
+    assert.equal(h.ledger.entries.length, 0, 'a quote books nothing')
+  })
+})
+
+test('THE RULE: the desk routes take an admin role, and no service scope substitutes', { skip }, async () => {
+  /*
+   * micro-org#495 §2 asked for `requireAdmin` and not a scope, and the two are not interchangeable:
+   * a scope is an authority a SERVICE token carries, so granting one to a service that needed it
+   * for something else would hand it the platform's own stock as well. `requireAdmin` is
+   * `kind === 'user' && roles.includes('admin')`, so EVERY service principal is refused here
+   * whatever it holds — which is what the second half of this asserts.
+   */
+  const service = await sign({ sub: 'service:hub-api', scopes: [READ_SCOPE, MONEY_SCOPE] })
+  await withServer({}, async (rig) => {
+    for (const headers of [asUser(), { authorization: `Bearer ${service}` }]) {
+      const res = await fetch(`${rig.url}/v1/admin/exchange-desk`, { headers })
+      assert.equal(res.status, 403)
+      const body = (await res.json()) as { error: { code: string; message: string } }
+      assert.equal(body.error.code, 'forbidden')
+      assert.match(body.error.message, /role:admin/)
+    }
+
+    const funding = await fetch(`${rig.url}/v1/admin/exchange-desk/funding`, {
+      method: 'POST',
+      headers: asUser({ 'idempotency-key': 'fund-1' }),
+      body: JSON.stringify({
+        sourceAccount: 'platform',
+        assetCode: 'SHARD',
+        amount: '1',
+        reason: 'x',
+      }),
+    })
+    assert.equal(funding.status, 403)
+    assert.equal(h.ledger.entries.length, 0)
+  })
+})
+
+test('an operator funds the desk, reads it back, and can take it out again', { skip }, async () => {
+  h.ledger.credit(`user:${USER}`, 'SHARD', 5_000n)
+  await withServer({}, async (rig) => {
+    const fund = await fetch(`${rig.url}/v1/admin/exchange-desk/funding`, {
+      method: 'POST',
+      headers: asAdmin({ 'idempotency-key': 'desk-fund-1' }),
+      body: JSON.stringify({
+        sourceAccount: `user:${USER}`,
+        assetCode: 'SHARD',
+        amount: '1000',
+        reason: 'seeding the SHARD book',
+      }),
+    })
+    assert.equal(fund.status, 201)
+    const funded = (await fund.json()) as {
+      entryId: string
+      replayed: boolean
+      summary: Record<string, unknown>
+    }
+    assert.equal(funded.replayed, false)
+    assert.equal(funded.summary['direction'], 'in')
+
+    const read = await fetch(`${rig.url}/v1/admin/exchange-desk`, { headers: asAdmin() })
+    assert.equal(read.status, 200)
+    assert.deepEqual(await read.json(), {
+      subject: 'exchange',
+      inventory: [{ assetCode: 'SHARD', amount: '1000', amountFormatted: '1000' }],
+    })
+
+    // The reversing sibling is the same route with the direction flipped — §2's requirement that a
+    // funding be undoable by something other than hand-written SQL.
+    const back = await fetch(`${rig.url}/v1/admin/exchange-desk/funding`, {
+      method: 'POST',
+      headers: asAdmin({ 'idempotency-key': 'desk-fund-2' }),
+      body: JSON.stringify({
+        sourceAccount: `user:${USER}`,
+        assetCode: 'SHARD',
+        amount: '1000',
+        reason: 'wrong book',
+        direction: 'out',
+      }),
+    })
+    assert.equal(back.status, 201)
+    assert.equal(h.ledger.balanceOf('exchange', 'SHARD', 'inventory'), 0n)
+    assert.equal(h.ledger.balanceOf(`user:${USER}`, 'SHARD', 'available'), 5_000n)
+  })
+})
+
+test('a funding direction that is neither in nor out is refused', { skip }, async () => {
+  await withServer({}, async (rig) => {
+    const res = await fetch(`${rig.url}/v1/admin/exchange-desk/funding`, {
+      method: 'POST',
+      headers: asAdmin({ 'idempotency-key': 'desk-fund-1' }),
+      body: JSON.stringify({
+        sourceAccount: 'platform',
+        assetCode: 'SHARD',
+        amount: '1',
+        reason: 'x',
+        direction: 'sideways',
+      }),
+    })
+    assert.equal(res.status, 400)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'bad_field')
   })
 })
 

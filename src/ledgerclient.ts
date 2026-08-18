@@ -60,11 +60,33 @@ export const LEDGER_SCOPES: readonly LiveScope[] = Object.freeze([
 export class LedgerRefusedError extends Error {
   readonly code: string
   readonly status: number
-  constructor(status: number, code: string, message: string) {
+  /**
+   * Whose account the refusal was about, when the ledger says.
+   *
+   * **`insufficient_funds` is one code for two opposite facts, and this is what separates them.**
+   * Since micro-org#495 the exchange desk is an ordinary non-exempt account, so the ledger answers
+   * `insufficient_funds` both when the USER cannot afford the input leg of a conversion and when
+   * the PLATFORM cannot fill the output leg. One is "you do not have this" and the other is "we do
+   * not have this"; telling a person their balance is short when the desk is the thing that ran out
+   * is the mistake this field exists to make impossible. `money.ts` reads it and nothing else does.
+   *
+   * `null` when the ledger did not send it — an older build, or a refusal of a different kind.
+   * Absence must read as "unknown", never as "not the desk".
+   */
+  readonly subject: string | null
+  readonly purpose: string | null
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    detail: { readonly subject?: string | null; readonly purpose?: string | null } = {},
+  ) {
     super(message)
     this.name = 'LedgerRefusedError'
     this.code = code
     this.status = status
+    this.subject = detail.subject ?? null
+    this.purpose = detail.purpose ?? null
   }
 }
 
@@ -147,11 +169,74 @@ export interface LedgerBalance {
   readonly updatedAt: string | null
 }
 
+/* ------------------------------------------------------------------ reading the journal */
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE TWO READS BELOW ARE WHY MICRO-WALLET HAS NO CONVERSIONS TABLE.
+ *
+ * micro-org#495 §3 asked for a user's conversions and transfers to be read out of the journal
+ * rather than out of a wallet-side copy, and made the condition explicit: if the journal could not
+ * be queried that way, say so before adding a table. It could not — `GET /entries` filtered on
+ * `kind`, `originatingService` and `correlationId`, all properties of the entry rather than of
+ * whose money moved — so `subject` was added to micro-ledger's own list query, and these two
+ * methods are what reaches it. See the header of `money.ts`'s reading section.
+ *
+ * `ledger:read` covers both, and it is a SERVICE scope: no end user holds one. Which user's entries
+ * a request may see is decided in `server.ts` and in `readConversion`, on this side of the wire.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+export interface LedgerPosting {
+  readonly id: string
+  readonly accountId: string
+  readonly direction: 'debit' | 'credit'
+  readonly amount: bigint
+  readonly assetCode: LedgerAssetCode
+  readonly sequence: number
+}
+
+export interface LedgerEntry {
+  readonly id: string
+  readonly kind: string
+  readonly description: string | null
+  readonly originatingService: string
+  readonly actor: string
+  readonly correlationId: string
+  readonly idempotencyKey: string
+  readonly reversesEntryId: string | null
+  readonly occurredAt: string
+  readonly recordedAt: string
+  /** Open-ended by contract, so it is read as unknown and narrowed at the point of use. */
+  readonly metadata: Readonly<Record<string, unknown>>
+  readonly postings: readonly LedgerPosting[]
+}
+
+export interface ListEntriesQuery {
+  readonly limit: number
+  /** Keyset cursor: the `id` of the last entry of the previous page. */
+  readonly cursor?: string
+  readonly kind?: EntryKind
+  readonly originatingService?: string
+  readonly correlationId?: string
+  /** Entries with a posting against an account of this subject — `user:<uuid>`, `exchange`. */
+  readonly subject?: string
+}
+
+export interface LedgerEntryPage {
+  readonly entries: readonly LedgerEntry[]
+  /** Null on the last page. Callers page until it is null, never by counting. */
+  readonly nextCursor: string | null
+}
+
 export interface LedgerClient {
   balances(subject: string): Promise<readonly LedgerBalance[]>
   postEntry(request: PostEntryRequest): Promise<PostedEntry>
   reserve(request: ReserveRequest): Promise<Reservation>
   release(reservationId: string, request: ReleaseRequest): Promise<PostedEntry>
+  listEntries(query: ListEntriesQuery): Promise<LedgerEntryPage>
+  /** Null when there is no such entry. A 404 from the ledger is an answer, not a failure. */
+  readEntry(entryId: string): Promise<LedgerEntry | null>
 }
 
 export interface LedgerClientOptions {
@@ -253,6 +338,44 @@ export function httpLedgerClient(options: LedgerClientOptions): LedgerClient {
       return { reservationId: body.reservationId, entryId: body.entry.id, replayed: body.replayed }
     },
 
+    async listEntries(query) {
+      const params = new URLSearchParams({ limit: String(query.limit) })
+      for (const [name, value] of [
+        ['cursor', query.cursor],
+        ['kind', query.kind],
+        ['originatingService', query.originatingService],
+        ['correlationId', query.correlationId],
+        ['subject', query.subject],
+      ] as const) {
+        if (value !== undefined) params.set(name, value)
+      }
+      try {
+        const body = await client.get<{ entries: readonly RawEntryView[]; nextCursor: string | null }>(
+          `/entries?${params.toString()}`,
+        )
+        return { entries: body.entries.map(toEntry), nextCursor: body.nextCursor ?? null }
+      } catch (err) {
+        throw translate(err)
+      }
+    },
+
+    async readEntry(entryId) {
+      try {
+        const body = await client.get<{ entry: RawEntryView }>(
+          `/entries/${encodeURIComponent(entryId)}`,
+        )
+        return toEntry(body.entry)
+      } catch (err) {
+        const translated = translate(err)
+        // A 404 is the ledger answering the question, not failing to. Every caller of this would
+        // otherwise write the same catch, and one of them would eventually forget and turn "no such
+        // conversion" into a 500. A 400 is NOT swallowed: the ledger refuses a non-uuid id there,
+        // and that is a caller's mistake which must not read as "not found".
+        if (translated instanceof LedgerRefusedError && translated.status === 404) return null
+        throw translated
+      }
+    },
+
     async release(reservationId, request) {
       const body = await post<{ entry: RawEntry; replayed: boolean }>(
         `/reservations/${encodeURIComponent(reservationId)}/release`,
@@ -291,6 +414,55 @@ interface RawEntry {
   readonly recordedAt: string
 }
 
+interface RawPostingView {
+  readonly id: string
+  readonly accountId: string
+  readonly direction: 'debit' | 'credit'
+  readonly amount: string
+  readonly assetCode: LedgerAssetCode
+  readonly sequence: number
+}
+
+interface RawEntryView {
+  readonly id: string
+  readonly kind: string
+  readonly description: string | null
+  readonly originatingService: string
+  readonly actor: string
+  readonly correlationId: string
+  readonly idempotencyKey: string
+  readonly reversesEntryId: string | null
+  readonly occurredAt: string
+  readonly recordedAt: string
+  readonly metadata: Readonly<Record<string, unknown>> | null
+  readonly postings: readonly RawPostingView[]
+}
+
+/** The wire's decimal strings become `bigint` here, once, for the same reason the header gives. */
+function toEntry(raw: RawEntryView): LedgerEntry {
+  return {
+    id: raw.id,
+    kind: raw.kind,
+    description: raw.description,
+    originatingService: raw.originatingService,
+    actor: raw.actor,
+    correlationId: raw.correlationId,
+    idempotencyKey: raw.idempotencyKey,
+    reversesEntryId: raw.reversesEntryId,
+    occurredAt: raw.occurredAt,
+    recordedAt: raw.recordedAt,
+    metadata: raw.metadata ?? {},
+    postings: (raw.postings ?? []).map((posting) => ({
+      id: posting.id,
+      accountId: posting.accountId,
+      direction: posting.direction,
+      amount: BigInt(posting.amount),
+      assetCode: posting.assetCode,
+      sequence: posting.sequence,
+    })),
+  }
+}
+
 /**
  * Turn an HTTP failure into one of the two things a caller can act on.
  *
@@ -302,20 +474,32 @@ interface RawEntry {
 function translate(err: unknown): Error {
   if (err instanceof HttpError && err.peerDecided) {
     const parsed = parseError(err.body)
-    return new LedgerRefusedError(err.status, parsed.code, parsed.message)
+    return new LedgerRefusedError(err.status, parsed.code, parsed.message, parsed)
   }
   return new LedgerUnavailableError(err instanceof Error ? err.message : String(err))
 }
 
-function parseError(body: string): { code: string; message: string } {
+interface ParsedError {
+  readonly code: string
+  readonly message: string
+  /** `micro-ledger`'s `errorReply` puts these beside `code` on an `insufficient_funds` refusal. */
+  readonly subject: string | null
+  readonly purpose: string | null
+}
+
+function parseError(body: string): ParsedError {
   try {
     const parsed: unknown = JSON.parse(body)
-    const error = (parsed as { error?: { code?: unknown; message?: unknown } }).error
+    const error = (parsed as {
+      error?: { code?: unknown; message?: unknown; subject?: unknown; purpose?: unknown }
+    }).error
     return {
       code: typeof error?.code === 'string' ? error.code : 'ledger_error',
       message: typeof error?.message === 'string' ? error.message : body.slice(0, 500),
+      subject: typeof error?.subject === 'string' ? error.subject : null,
+      purpose: typeof error?.purpose === 'string' ? error.purpose : null,
     }
   } catch {
-    return { code: 'ledger_error', message: body.slice(0, 500) }
+    return { code: 'ledger_error', message: body.slice(0, 500), subject: null, purpose: null }
   }
 }

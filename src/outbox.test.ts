@@ -16,6 +16,7 @@ import {
   type EventVersion,
 } from '@cloudsforge/contracts-events'
 import {
+  CONVERSION_COMPLETED,
   DEPOSIT_ADDRESS_ASSIGNED,
   DEPOSIT_CREDITED,
   DEPOSIT_TOKEN_UNCREDITED,
@@ -79,6 +80,7 @@ test('every topic obeys the registry’s shape rule', () => {
     WITHDRAWAL_REQUESTED,
     WITHDRAWAL_REFUNDED,
     WITHDRAWAL_STUCK,
+    CONVERSION_COMPLETED,
     INDEXER_DEPOSIT_CONFIRMED,
   ]
   for (const topic of topics) {
@@ -92,6 +94,10 @@ test('every topic obeys the registry’s shape rule', () => {
   assert.equal(DEPOSIT_CREDITED, 'wallet.deposit.confirmed')
   assert.equal(WALLET_CREATED, 'wallet.wallet.created')
   assert.equal(WITHDRAWAL_REQUESTED, 'wallet.withdrawal.requested')
+  // micro-org#495 §4's topic, spelled as `contracts-events`, micro-activity's classifier and
+  // micro-notify's catalogue all spell it. `validateEnvelope` quarantines an unregistered topic, so
+  // the four have to agree exactly or the conversion feed is a backlog of poisoned rows.
+  assert.equal(CONVERSION_COMPLETED, 'wallet.conversion.completed')
 })
 
 test('a signature verifies, and one byte of tampering does not', () => {

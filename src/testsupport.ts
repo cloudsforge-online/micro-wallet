@@ -29,7 +29,7 @@ import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger } from '@cloudsforge/telemetry'
-import type { LedgerAssetCode } from '@cloudsforge/contracts-money'
+import type { AccountType, LedgerAssetCode } from '@cloudsforge/contracts-money'
 import type { Network } from '@cloudsforge/contracts-chain'
 import { toChecksumAddress, type ChainId } from './addresses.ts'
 import type { DepositDeps } from './deposits.ts'
@@ -50,6 +50,7 @@ import {
   LedgerRefusedError,
   type LedgerBalance,
   type LedgerClient,
+  type LedgerEntry,
   type PostEntryRequest,
   type PostedEntry,
   type ReleaseRequest,
@@ -72,6 +73,16 @@ interface FakeEntry {
    * retired-asset guard keys on.
    */
   readonly postings?: PostEntryRequest['postings']
+  /**
+   * The entry as `GET /entries` would return it, built at post time.
+   *
+   * micro-org#495 §3 made micro-wallet a READER of the journal — `/v1/conversions` and
+   * `/v1/transfers` page it by subject and kind rather than keeping a wallet-side table — so a fake
+   * that could only be posted to could not exercise either route. Built here from the request
+   * rather than from a second description of it, so the shape a test reads back is the shape the
+   * code under test actually sent.
+   */
+  readonly view?: LedgerEntry
   readonly response: PostedEntry | Reservation
   /** For a reservation: what to move back on release. */
   readonly reservation?: {
@@ -84,6 +95,15 @@ interface FakeEntry {
 export interface FakeLedger extends LedgerClient {
   /** Seed a starting balance without going through a posting. */
   credit(subject: string, assetCode: LedgerAssetCode, amount: bigint): void
+  /**
+   * Seed the exchange desk's inventory without going through `fundDesk`.
+   *
+   * Separate from `credit` because it is a different ACCOUNT — `exchange`/`inventory`/`equity`
+   * rather than a user's `available` liability — and because a test about what a conversion does
+   * should not have to first arrange a treasury, an operator and a funding request in order to say
+   * "the desk has some EMBER". The funding path has its own tests, which use the real one.
+   */
+  seedDesk(assetCode: LedgerAssetCode, amount: bigint): void
   balanceOf(subject: string, assetCode: LedgerAssetCode, purpose: string): bigint
   readonly entries: readonly FakeEntry[]
   /** Every idempotency key it has seen, in order. The double-credit tests read this. */
@@ -111,10 +131,21 @@ const accountKey = (subject: string, assetCode: string, purpose: string): string
 
 export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger {
   const balances = new Map<string, bigint>()
+  /**
+   * Each account's `type`, remembered from the first posting that named it.
+   *
+   * The real ledger stores it on the account row and `GET /accounts/:subject/balances` returns it;
+   * this used to answer `'liability'` for every account, which was harmless while every balance a
+   * test read was a user's, and stopped being harmless the moment `readDeskInventory` began asking
+   * the ledger what the `exchange` subject holds.
+   */
+  const types = new Map<string, AccountType>()
   const entries: FakeEntry[] = []
   const byKey = new Map<string, FakeEntry>()
   const keys: string[] = []
   const frozen = new Map<string, string>()
+  /** Entry id -> the subjects it touched, which is what the ledger's `subject` filter matches on. */
+  const subjects = new Map<string, ReadonlySet<string>>()
   // The fake's stand-in for the real ledger's row locks. See the file header.
   let chain: Promise<unknown> = Promise.resolve()
   let counter = 0
@@ -134,13 +165,73 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
     return next
   }
 
-  const move = (subject: string, assetCode: string, purpose: string, delta: bigint): void => {
+  const move = (
+    subject: string,
+    assetCode: string,
+    purpose: string,
+    delta: bigint,
+    type: AccountType = 'liability',
+  ): void => {
     const key = accountKey(subject, assetCode, purpose)
     balances.set(key, (balances.get(key) ?? 0n) + delta)
+    // First writer wins, as in the real ledger: `ensureAccount` does not change an existing
+    // account's type as a side effect of a posting that refers to it.
+    if (!types.has(key)) types.set(key, type)
   }
 
   const balanceOf = (subject: string, assetCode: string, purpose: string): bigint =>
     balances.get(accountKey(subject, assetCode, purpose)) ?? 0n
+
+  /**
+   * The entry as `GET /entries` returns it, built from the request that produced it.
+   *
+   * `accountId` is the fake's account key rather than a uuid, so that the id a balance carries and
+   * the id a posting carries are the same string for the same account — the property the real
+   * ledger has. Nothing may parse it: whose account a posting is against is deliberately not
+   * derivable from an entry in the real ledger either, which is why `readConversion` proves
+   * ownership from the correlation id instead.
+   */
+  const view = (
+    id: string,
+    kind: string,
+    recordedAt: string,
+    request: {
+      readonly actor: string
+      readonly correlationId: string
+      readonly idempotencyKey: string
+      readonly description?: string
+      readonly metadata?: Readonly<Record<string, unknown>>
+      readonly postings: PostEntryRequest['postings']
+    },
+  ): LedgerEntry => {
+    subjects.set(id, new Set(request.postings.map((posting) => posting.account.subject)))
+    return {
+      id,
+      kind,
+      description: request.description ?? null,
+      // The fake is only ever this service's client, so there is one possible answer.
+      originatingService: 'wallet',
+      actor: request.actor,
+      correlationId: request.correlationId,
+      idempotencyKey: request.idempotencyKey,
+      reversesEntryId: null,
+      occurredAt: recordedAt,
+      recordedAt,
+      metadata: request.metadata ?? {},
+      postings: request.postings.map((posting) => ({
+        id: `${id}-p${posting.sequence}`,
+        accountId: accountKey(
+          posting.account.subject,
+          posting.account.assetCode,
+          posting.account.purpose,
+        ),
+        direction: posting.direction,
+        amount: posting.amount,
+        assetCode: posting.assetCode,
+        sequence: posting.sequence,
+      })),
+    }
+  }
 
   const claim = (key: string, body: unknown): FakeEntry | null => {
     const existing = byKey.get(key)
@@ -160,7 +251,32 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
     keys,
 
     credit(subject, assetCode, amount) {
-      move(subject, assetCode, 'available', amount)
+      move(subject, assetCode, 'available', amount, 'liability')
+      /*
+       * ── AND THE ASSET SIDE, BECAUSE A LIABILITY WITH NOTHING BEHIND IT IS NOT A STARTING STATE ──
+       *
+       * This used to move one balance, which was fine only while the fake refused a negative
+       * balance on liabilities alone. Once it models migration 7 properly — every type but
+       * `clearing` reaches the raise — a suite that seeded a user's coins out of nowhere could no
+       * longer SETTLE a withdrawal of them: `settleWithdrawal` credits `custody`/`asset`, custody
+       * had never been debited, and the trigger refused it. That refusal is correct in production
+       * and the fixture was the thing that was wrong, so the fixture now seeds the deposit's other
+       * leg as well: `credit` stands in for a deposit, and a deposit debits custody.
+       *
+       * A test that asserted custody's balance ending up NEGATIVE was asserting a state Postgres
+       * will not hold. Two of them existed; both now read the balance the same movement really
+       * leaves behind.
+       */
+      move('custody', assetCode, 'available', amount, 'asset')
+    },
+
+    seedDesk(assetCode, amount) {
+      // `'exchange'`, `'inventory'` and `'equity'` are spelled out rather than imported from
+      // `money.ts`, under the same rule the retired-asset guard below is modelled by: a fake that
+      // shared the production constant would agree with a mistake in it, and the point of this one
+      // is to be the other side of the boundary. If this line and `desk()` ever disagree, the desk
+      // tests fail, which is the correct outcome.
+      move('exchange', assetCode, 'inventory', amount, 'equity')
     },
 
     freezeWithdrawals(assetCode, reason) {
@@ -180,7 +296,7 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
           accountId: key,
           assetCode: assetCode as LedgerAssetCode,
           purpose: purpose as LedgerBalance['purpose'],
-          type: 'liability',
+          type: types.get(key) ?? 'liability',
           status: 'open',
           amount,
           updatedAt: new Date(0).toISOString(),
@@ -226,8 +342,28 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
         const replay = claim(request.idempotencyKey, request)
         if (replay) return { ...(replay.response as PostedEntry), replayed: true }
 
-        // Applied in the account's own normal direction, which for a liability is credit-positive
-        // and for an asset is debit-positive — `normalBalance` in contracts-money.
+        /*
+         * ── STAGED FIRST, APPLIED SECOND, BECAUSE A REFUSED ENTRY MUST LEAVE NOTHING BEHIND ────
+         *
+         * The real ledger writes an entry's postings in one transaction, so a posting the overdraft
+         * trigger refuses rolls back the ones before it. This loop used to mutate `balances` as it
+         * went and throw from the middle, and the entry that exposes the difference is precisely the
+         * one micro-org#495 asks for a test of: a conversion is refused on its THIRD posting, the
+         * desk's output leg, by which point a mutating loop has already debited the user on its
+         * first. "The response was 409" would have passed; "the journal has no entry, and no balance
+         * moved" would not have.
+         *
+         * Amounts are applied in the account's own normal direction, which for a liability is
+         * credit-positive and for an asset is debit-positive — `normalBalance` in contracts-money.
+         */
+        const pending = new Map<string, bigint>()
+        const writes: Array<{
+          subject: string
+          assetCode: string
+          purpose: string
+          delta: bigint
+          type: AccountType
+        }> = []
         for (const posting of request.postings) {
           /*
            * A POSTING'S DECLARED ASSET AND ITS ACCOUNT'S ASSET MUST BE THE SAME ASSET.
@@ -256,18 +392,59 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
               ? posting.direction === 'debit'
               : posting.direction === 'credit'
           const delta = increases ? posting.amount : -posting.amount
+          const key = accountKey(
+            posting.account.subject,
+            posting.assetCode,
+            posting.account.purpose,
+          )
           const after =
-            balanceOf(posting.account.subject, posting.assetCode, posting.account.purpose) + delta
-          // A liability that would go negative is the ledger's hard refusal, and it is what makes
-          // an unaffordable spend a 409 rather than an overdraft.
-          if (after < 0n && posting.account.type === 'liability') {
+            (pending.get(key) ??
+              balanceOf(posting.account.subject, posting.assetCode, posting.account.purpose)) + delta
+          /*
+           * ════════════════════════════════════════════════════════════════════════════════════
+           * MIGRATION 7'S OVERDRAFT TRIGGER — WHICH IS NOT A RULE ABOUT LIABILITIES.
+           *
+           * This used to refuse a negative balance only when the account's type was `liability`,
+           * and that made the fake agree with a belief about `ledger_assert_no_overdraft()` that
+           * the trigger does not hold. Read it in order: it returns early for `type = 'clearing'`,
+           * then returns early for `overdraft_allowed or purpose = 'suspense'`, and otherwise
+           * raises. EVERY other type reaches the raise — asset, revenue, expense and equity alike.
+           *
+           * The gap was not academic. micro-org#495 moved the conversion counter-account from
+           * `clearing` to an `equity` desk precisely because equity reaches that check, and a fake
+           * that refused only liabilities would have let an empty desk fill an order and reported
+           * the whole change as working. Nothing this service posts sets `overdraft_allowed`, so
+           * the two exemptions below are the whole of it.
+           *
+           * The message is the trigger's own wording, because `micro-ledger` passes the Postgres
+           * exception text through to its caller verbatim and recovers the subject and purpose out
+           * of it; `money.ts` reads the structured `subject` to tell "you do not have this" from
+           * "we do not have this", and a tidier sentence here would make that untestable.
+           * ════════════════════════════════════════════════════════════════════════════════════
+           */
+          const exempt =
+            posting.account.type === 'clearing' || posting.account.purpose === 'suspense'
+          if (after < 0n && !exempt) {
             throw new LedgerRefusedError(
               409,
               'insufficient_funds',
-              `${posting.account.subject} has insufficient ${posting.assetCode}`,
+              `account ${key} (${posting.account.subject} ${posting.account.purpose}) would go to ` +
+                `${after} — a ${posting.account.type} account may not go negative without ` +
+                'overdraft_allowed',
+              { subject: posting.account.subject, purpose: posting.account.purpose },
             )
           }
-          move(posting.account.subject, posting.assetCode, posting.account.purpose, delta)
+          pending.set(key, after)
+          writes.push({
+            subject: posting.account.subject,
+            assetCode: posting.assetCode,
+            purpose: posting.account.purpose,
+            delta,
+            type: posting.account.type,
+          })
+        }
+        for (const write of writes) {
+          move(write.subject, write.assetCode, write.purpose, write.delta, write.type)
         }
 
         counter += 1
@@ -284,6 +461,7 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
           fingerprint: fingerprint(request),
           response,
           postings: request.postings,
+          view: view(response.id, request.kind, response.recordedAt, request),
         }
         entries.push(entry)
         byKey.set(request.idempotencyKey, entry)
@@ -326,12 +504,24 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
           entryId: `entry-${counter}`,
           replayed: false,
         }
+        const kind = request.kind ?? 'withdrawal_requested'
+        const recordedAt = new Date(counter).toISOString()
         const entry: FakeEntry = {
           id: response.entryId,
-          kind: 'withdrawal_requested',
-          recordedAt: new Date(counter).toISOString(),
+          kind,
+          recordedAt,
           fingerprint: fingerprint(request),
           response,
+          // A reservation IS an entry in the real ledger, with the two postings this call implies,
+          // so it appears in `listEntries` like any other rather than being invisible to a read.
+          view: view(response.entryId, kind, recordedAt, {
+            actor: request.actor,
+            correlationId: request.correlationId,
+            idempotencyKey: request.idempotencyKey,
+            ...(request.description !== undefined ? { description: request.description } : {}),
+            ...(request.metadata !== undefined ? { metadata: request.metadata } : {}),
+            postings: reservationPostings(request.subject, request.assetCode, request.amount, 'in'),
+          }),
           reservation: {
             subject: request.subject,
             assetCode: request.assetCode,
@@ -380,13 +570,91 @@ export function fakeLedger(options: { failWith?: () => Error } = {}): FakeLedger
           recordedAt: response.recordedAt,
           fingerprint: fingerprint({ reservationId, ...request }),
           response,
+          view: view(response.id, response.kind, response.recordedAt, {
+            actor: request.actor,
+            correlationId: request.correlationId,
+            idempotencyKey: request.idempotencyKey,
+            ...(request.description !== undefined ? { description: request.description } : {}),
+            postings: reservationPostings(
+              original.reservation.subject,
+              original.reservation.assetCode,
+              original.reservation.amount,
+              'out',
+            ),
+          }),
         }
         entries.push(entry)
         byKey.set(request.idempotencyKey, entry)
         return response
       })
     },
+
+    /*
+     * ── THE TWO READS micro-org#495 §3 ADDED, AND THE ONE THING THEY DO NOT MODEL ─────────────
+     *
+     * Filtering is the real ledger's: `kind`, `originatingService`, `correlationId` and `subject`
+     * are ANDed, newest first, keyset-paged. The cursor is matched by identity rather than by
+     * `id < cursor` because this fake's ids are `entry-1`, `entry-2`, … and `entry-10` sorts below
+     * `entry-2`; the real ledger's are UUIDv7, where the string order IS the time order. A test
+     * that depended on the ordering of the id STRINGS would be depending on the fake, so it is the
+     * position in the filtered list that decides the page — the behaviour a caller can see is the
+     * same, and the fake's ids stay readable in a failure message.
+     */
+    async listEntries(query) {
+      const matches = entries
+        .flatMap((entry) => (entry.view ? [entry.view] : []))
+        .filter((entry) => query.kind === undefined || entry.kind === query.kind)
+        .filter(
+          (entry) =>
+            query.originatingService === undefined ||
+            entry.originatingService === query.originatingService,
+        )
+        .filter(
+          (entry) => query.correlationId === undefined || entry.correlationId === query.correlationId,
+        )
+        .filter(
+          (entry) => query.subject === undefined || subjects.get(entry.id)?.has(query.subject),
+        )
+        .reverse()
+      const start =
+        query.cursor === undefined ? 0 : matches.findIndex((e) => e.id === query.cursor) + 1
+      const page = matches.slice(start, start + query.limit)
+      const last = page[page.length - 1]
+      // Null on the last page, so a caller that pages until null terminates. A cursor is returned
+      // only when there is something after it, never merely because the page was full.
+      const more = matches.length > start + page.length
+      return { entries: page, nextCursor: more && last ? last.id : null }
+    },
+
+    async readEntry(entryId) {
+      return entries.find((entry) => entry.id === entryId)?.view ?? null
+    },
   }
+}
+
+/**
+ * The two postings a reservation or its release is, in the real ledger.
+ *
+ * `in` moves a user's balance from `available` to `reserved` and `out` moves it back. Spelled here
+ * rather than taken from `movePostings` in contracts-money for the reason the retired-asset guard
+ * gives: this side of the boundary states the shape independently.
+ */
+function reservationPostings(
+  subject: string,
+  assetCode: LedgerAssetCode,
+  amount: bigint,
+  direction: 'in' | 'out',
+): PostEntryRequest['postings'] {
+  const account = (purpose: 'available' | 'reserved') =>
+    ({ subject, assetCode, purpose, type: 'liability' }) as const
+  const [from, to] =
+    direction === 'in'
+      ? ([account('available'), account('reserved')] as const)
+      : ([account('reserved'), account('available')] as const)
+  return [
+    { direction: 'debit', amount, assetCode, sequence: 0, account: from },
+    { direction: 'credit', amount, assetCode, sequence: 1, account: to },
+  ]
 }
 
 /* ------------------------------------------------------------------ custody */

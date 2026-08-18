@@ -43,6 +43,7 @@ import {
   TokenError,
   bearerFrom,
   isAdmin,
+  requireAdmin,
   requireScope,
   statusFor,
   subjectUserId,
@@ -88,7 +89,20 @@ import {
   verifyChallenge,
   type Authorisation,
 } from './links.ts'
-import { convert, MoneyError, spend, transfer, type MoneyDeps } from './money.ts'
+import {
+  convert,
+  DESK_SUBJECT,
+  deskInventory,
+  fundDesk,
+  listConversions,
+  listTransfers,
+  MoneyError,
+  quoteConversion,
+  readConversion,
+  spend,
+  transfer,
+  type MoneyDeps,
+} from './money.ts'
 import {
   EVENT_ID_HEADER,
   SIGNATURE_HEADER,
@@ -1062,6 +1076,195 @@ function buildRoutes(): Route[] {
       }
     }),
 
+    /**
+     * What a conversion would come to, without making one.
+     *
+     * `MONEY_SCOPE` rather than `READ_SCOPE`, and it is a POST rather than a GET, for the same
+     * reason: this is not a read of this service's state, it is the front half of the conversion —
+     * the same validation, the same pricing upstream, the same refusals — with the booking left
+     * off. A service that may not convert has no business asking the platform to quote it a market,
+     * and a caller that has this may as well be told the figures before it commits to them.
+     *
+     * No idempotency key, because nothing is claimed. `hold: false` and `holdNotice` in the body
+     * say that in a field a surface can render, which is the whole point of them being fields.
+     */
+    route('POST', '/v1/conversions/quote', async (ctx, deps) => {
+      await authenticate(ctx, deps, MONEY_SCOPE)
+      const body = await readJson(ctx.req)
+      const done = deps.lifecycle.track()
+      try {
+        const quote = await quoteConversion(deps.money, {
+          fromAssetCode: requireString(body, 'fromAssetCode'),
+          toAssetCode: requireString(body, 'toAssetCode'),
+          amount: requireAmount(body, 'amount'),
+        })
+        return { status: 200, body: { quote } }
+      } finally {
+        done()
+      }
+    }),
+
+    /**
+     * This user's conversions, newest first — read out of the journal, not out of a local table.
+     *
+     * micro-org#495 §3, and the header of `money.ts`'s reading section has the argument: the entry
+     * IS the conversion, and a wallet-side copy would be a second record of one fact, written in a
+     * second transaction, free to disagree with the first in a way the surface could not see.
+     */
+    route('GET', '/v1/conversions', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, READ_SCOPE)
+      const userId = actingUser(ctx, principal)
+      const done = deps.lifecycle.track()
+      try {
+        const page = await listConversions(deps.money, {
+          userId,
+          limit: limitFrom(ctx),
+          ...cursorFrom(ctx),
+        })
+        return { status: 200, body: page }
+      } finally {
+        done()
+      }
+    }),
+
+    /**
+     * One conversion, by the id of the journal entry that is it.
+     *
+     * **404 for somebody else's, not 403.** `readConversion` returns null for "no such entry", "not
+     * a conversion" and "not yours" alike, and this route cannot tell them apart either — which is
+     * deliberate, because a 403 on an id that exists and a 404 on one that does not is an oracle
+     * that turns this route into a way of enumerating other people's entry ids.
+     */
+    route('GET', '/v1/conversions/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, READ_SCOPE)
+      const userId = actingUser(ctx, principal)
+      const done = deps.lifecycle.track()
+      try {
+        const conversion = await readConversion(deps.money, {
+          userId,
+          entryId: ctx.params['id'] ?? '',
+        })
+        if (!conversion) {
+          throw new BadRequestError('conversion_not_found', 'no such conversion', 404)
+        }
+        return { status: 200, body: { conversion } }
+      } finally {
+        done()
+      }
+    }),
+
+    /**
+     * This user's transfers, sent and received, newest first.
+     *
+     * Same source and same reason as `/v1/conversions`. Both ends are here rather than only the
+     * sent ones: the ledger's subject filter returns an ENTRY that touches this user's account
+     * whichever side of it they were on, and a "transfers" list missing what somebody was sent
+     * would be a strange thing to hand a person looking for money a friend says they sent.
+     */
+    route('GET', '/v1/transfers', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, READ_SCOPE)
+      const userId = actingUser(ctx, principal)
+      const done = deps.lifecycle.track()
+      try {
+        const page = await listTransfers(deps.money, {
+          userId,
+          limit: limitFrom(ctx),
+          ...cursorFrom(ctx),
+        })
+        return { status: 200, body: page }
+      } finally {
+        done()
+      }
+    }),
+
+    /* --------------------------------------------------------------- the exchange desk */
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * BOTH DESK ROUTES ARE `requireAdmin`, AND THAT IS A DIFFERENT GATE FROM A SERVICE SCOPE.
+     *
+     * micro-org#495 §2 asked for the role and not a scope, and the difference is exactly the one
+     * `assertOwner` spends a paragraph on: a scope is an authority a SERVICE token carries, and
+     * granting `wallet:money` to a service that needed it for one purpose would hand it the desk's
+     * inventory as well. `requireAdmin` is `principal.kind === 'user' && roles.includes('admin')`,
+     * so **every service principal is refused here whatever it holds** — funding the desk is an
+     * operator's decision, made by a person who can be asked why, and there is no automation in
+     * this estate that should be moving the platform's own stock on its own initiative.
+     *
+     * The scope passed to `authenticate` is therefore unreachable rather than redundant: a service
+     * that satisfies it still fails the next line. It is stated anyway so that these routes read
+     * like every other one in this file and so the scope catalogue stays true.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+
+    /**
+     * What the desk is holding, per asset.
+     *
+     * The figure IS returned here, unlike in the `desk_inventory_short` a user gets — the audience
+     * is an operator deciding whether to fund it, not an anonymous caller who would be handed a
+     * trading signal for the price of one request. See `deskInventory`.
+     */
+    route('GET', '/v1/admin/exchange-desk', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, READ_SCOPE)
+      requireAdmin(principal)
+      const done = deps.lifecycle.track()
+      try {
+        const inventory = await deskInventory(deps.money)
+        return { status: 200, body: { subject: DESK_SUBJECT, inventory } }
+      } finally {
+        done()
+      }
+    }),
+
+    /**
+     * Put stock into the desk, or take it back out.
+     *
+     * `direction: 'in' | 'out'` on the one route is the reversing sibling §2 asks for. A separate
+     * un-funding route would have been a second code path for the same two postings with their ends
+     * swapped, and the day an operator needed it would have been the day it was found not to work;
+     * this way the reversal is exercised by the same tests, carries the same idempotency key
+     * discipline and the same recorded `reason`, and is refused by the ledger if it would draw the
+     * inventory below zero.
+     */
+    route('POST', '/v1/admin/exchange-desk/funding', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps, MONEY_SCOPE)
+      requireAdmin(principal)
+      const body = await readJson(ctx.req)
+      const clientKey = requireIdempotencyKey(
+        'POST /v1/admin/exchange-desk/funding',
+        idempotencyKeyOf(ctx, body),
+      )
+
+      const done = deps.lifecycle.track()
+      try {
+        const result = await fundDesk(deps.money, {
+          // The OPERATOR, not a user the request names. The desk belongs to nobody, so the
+          // idempotency key is namespaced by whoever asked — see `RunInput.userId`.
+          adminUserId: subjectUserId(principal),
+          sourceAccount: requireString(body, 'sourceAccount'),
+          assetCode: requireString(body, 'assetCode'),
+          amount: requireAmount(body, 'amount'),
+          reason: requireString(body, 'reason'),
+          direction: fundingDirection(body),
+          clientKey,
+          correlationId: ctx.requestId,
+          actor: actorOf(principal),
+        })
+        deps.metrics.increment('wallet_money_operations_total', {
+          route: 'desk_funding',
+          outcome: result.replayed ? 'replayed' : 'posted',
+        })
+        ctx.log.info('exchange desk funded', {
+          entryId: result.entryId,
+          replayed: result.replayed,
+          ...result.summary,
+        })
+        return { status: result.replayed ? 200 : 201, body: result }
+      } finally {
+        done()
+      }
+    }),
+
     /* --------------------------------------------------------------- portfolio */
 
     route('GET', '/v1/portfolio', async (ctx, deps) => {
@@ -1439,6 +1642,23 @@ function settableStatus(raw: string): WalletStatus {
     )
   }
   return raw as WalletStatus
+}
+
+/**
+ * Which way the desk funding goes.
+ *
+ * Defaulted to `in`, because that is what an operator who omits it meant — nobody types a funding
+ * request intending to empty the desk. Anything other than the two words is refused rather than
+ * treated as the default: a client sending `direction: 'reverse'` and being quietly funded again is
+ * the failure this refusal exists for, and it moves money.
+ */
+function fundingDirection(body: Record<string, unknown>): 'in' | 'out' {
+  const raw = optionalString(body, 'direction')
+  if (raw === undefined) return 'in'
+  if (raw !== 'in' && raw !== 'out') {
+    throw new BadRequestError('bad_field', "direction must be 'in' or 'out'")
+  }
+  return raw
 }
 
 function requireChainField(body: Record<string, unknown>): ChainId {
