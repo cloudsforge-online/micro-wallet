@@ -32,6 +32,8 @@
  *    crediting path at all.
  */
 
+import { NetworkUnknownError, requestNetwork } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -108,7 +110,7 @@ import {
   SIGNATURE_HEADER,
   verifyDelivery,
 } from '@cloudsforge/contracts-events'
-import { INDEXER_DEPOSIT_CONFIRMED } from './outbox.ts'
+import { INDEXER_DEPOSIT_CONFIRMED, type Db } from './outbox.ts'
 import { readPortfolio, type PortfolioDeps } from './portfolio.ts'
 import { SETTLEMENT_CONFIRMED, SETTLEMENT_FAILED } from './settlement.ts'
 import {
@@ -143,7 +145,22 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
+  /**
+   * The boot-time default. `forRequest` replaces it with the estate the gateway stamped.
+   *
+   * Not a label: wallet's `network` decides which chain a deposit is watched on and which estate a
+   * withdrawal leaves. One pod serving both has no process-wide answer.
+   */
   readonly network: Network
+  /**
+   * The per-network SELECTOR. The four bundles below are boot-time values; `forRequest` rebuilds
+   * each against this request's handle before any route sees them.
+   *
+   * `NetworkSql` has no query methods, so nothing can read it directly by mistake.
+   */
+  readonly sql: NetworkSql
+  /** `CF_NETWORK_SINGLE`, for `pnpm dev`, which has no gateway to stamp the header. */
+  readonly singleNetwork?: Network
   readonly deposits: DepositDeps
   readonly withdrawals: WithdrawalDeps
   readonly money: MoneyDeps
@@ -425,12 +442,35 @@ interface Reply {
   readonly contentType?: string
 }
 
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
+
 interface RequestContext {
   readonly req: IncomingMessage
   readonly url: URL
   readonly params: Readonly<Record<string, string>>
   readonly requestId: string
   readonly log: Logger
+  /**
+   * The estate this REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both since the network consolidation, so "which
+   * estate am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The handle for `network`, resolved once at the edge.
+   *
+   * Every route uses this rather than `deps.sql`, which is a `NetworkSql` with no query methods —
+   * so the mistake does not compile. In THIS service a wrong handle credits a testnet deposit to a
+   * mainnet balance, and the wallet is where a user looks to find out what they own.
+   */
+  readonly sql: Db
 }
 
 interface Route {
@@ -464,7 +504,7 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
@@ -472,20 +512,52 @@ export function createServer(deps: ServerDeps): Server {
         method,
         route: routeLabel,
         status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
       })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, params: matched?.params ?? {}, requestId, log }, deps)
+    // ── THE ESTATE, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ────────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet. A 500 is a
+    // routing fault somebody fixes; a default credits one estate's deposit to the other estate's
+    // balance, and the wallet is precisely where a user goes to find out what they own.
+    const networkless = matched !== null && OPERATIONAL_ROUTES.has(matched.route.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(res, errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId), requestId)
+      finish(500, 'unknown')
+      return
+    }
+    const sql = deps.sql.for(network) as unknown as Db
+
+    void handle(
+      matched,
+      { req, url, params: matched?.params ?? {}, requestId, log, network, sql },
+      forRequest(deps, network, sql),
+    )
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         // Reaching here means the error mapping itself failed. Answer, then say so loudly.
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -506,6 +578,24 @@ export function createServer(deps: ServerDeps): Server {
  *   * **501** — a real feature of the model this build cannot perform. Never faked.
  *   * **503** — an upstream did not answer, or a fee could not be quoted. Retriable.
  */
+/**
+ * The deps a REQUEST sees: the estate, and all four domain bundles against its handle.
+ *
+ * Every one of them carries a pool reference, so rebuilding one and not the others would leave a
+ * deposit credited in one estate and a balance read from the other — which is worse than either
+ * mistake alone, because the two would disagree and neither would look wrong on its own.
+ */
+function forRequest(deps: ServerDeps, network: Network, sql: Db): ServerDeps {
+  return {
+    ...deps,
+    network,
+    deposits: { ...deps.deposits, sql },
+    withdrawals: { ...deps.withdrawals, sql },
+    money: { ...deps.money, sql },
+    portfolio: { ...deps.portfolio, sql },
+  }
+}
+
 async function handle(
   matched: { route: Route; params: Record<string, string> } | null,
   ctx: RequestContext,
