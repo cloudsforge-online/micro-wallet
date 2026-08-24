@@ -542,7 +542,29 @@ export function createServer(deps: ServerDeps): Server {
       finish(500, 'unknown')
       return
     }
-    const sql = deps.sql.for(network) as unknown as Db
+    // ── RESOLVED INSIDE A TRY, AND THAT IS NOT DEFENSIVE PADDING ───────────────────────────────
+    //
+    // `deps.sql.for()` THROWS when this deployment holds no handle for that network, and that
+    // refusal is the safety property the consolidation rests on — better a loud 500 than a query
+    // answered out of the other estate's rows.
+    //
+    // It runs BEFORE `handle` returns a promise, so an uncaught throw escapes the `void` expression
+    // past a `.catch` that is not attached yet, and the listener returns having sent NOTHING. The
+    // connection then hangs until the client gives up: the one path the design most depends on
+    // being loud was the one path that was silent.
+    let sql: Db
+    try {
+      sql = deps.sql.for(network) as unknown as Db
+    } catch (err) {
+      log.error('no usable database handle for this request', { err, network })
+      send(
+        res,
+        errorReply(500, 'network_unavailable', 'this deployment cannot serve that network', requestId),
+        requestId,
+      )
+      finish(500, network)
+      return
+    }
 
     void handle(
       matched,
