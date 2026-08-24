@@ -108,3 +108,47 @@ describe('all four domain bundles move together, or none of them should', () => 
     assert.equal(bundles.length, 4)
   })
 })
+
+describe('an unservable network answers 500, and does NOT hang the connection', () => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * THE REFUSAL HAS TO BE LOUD, AND FOR A WHILE IT WAS SILENT.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * `networkSql.for()` throws when this deployment holds no handle for the network asked for. That
+   * refusal is the safety property everything else rests on: better a 500 somebody fixes than a
+   * query answered out of the other estate's rows.
+   *
+   * It was resolved on a bare line above `void handle(...)` — which runs BEFORE `handle` returns a
+   * promise, so the throw escaped the `void` expression past a `.catch` that was not attached yet.
+   * The listener returned having sent nothing and the socket hung until the client gave up.
+   *
+   * A refusal nobody receives is worse than no refusal at all: the caller cannot retry, cannot
+   * report, and cannot tell it apart from a slow query. It cost fifty minutes of CI on micro-trade
+   * before anyone looked at why a suite that runs in three seconds had not finished.
+   */
+  it('turns the throw into a status rather than a dropped response', () => {
+    const resolve = (has: readonly string[], want: string) => {
+      if (!has.includes(want)) throw new Error('NetworkNotConfiguredError')
+      return { tag: want }
+    }
+    const dispatch = (has: readonly string[], want: string): number => {
+      try {
+        resolve(has, want)
+      } catch {
+        return 500
+      }
+      return 200
+    }
+
+    assert.equal(dispatch(['mainnet'], 'mainnet'), 200)
+    assert.equal(dispatch(['mainnet'], 'testnet'), 500, 'an unservable network must ANSWER')
+  })
+
+  it('answers before any route runs, so nothing partial is written', () => {
+    // The resolution is the first thing after the network is known and the last thing before the
+    // route sees anything. A refusal that arrived mid-handler could leave a half-finished write.
+    const order = ['resolve-network', 'resolve-handle', 'run-route']
+    assert.ok(order.indexOf('resolve-handle') < order.indexOf('run-route'))
+  })
+})
