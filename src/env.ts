@@ -193,6 +193,18 @@ export interface Env {
    * connection-string variable, so adding a second one here fails the build rather than review.
    */
   readonly databaseUrl: string
+  /**
+   * The TESTNET database, when this deployment serves both networks. Empty means single-network —
+   * `networkSql` then holds one handle and REFUSES a testnet request rather than answering it out
+   * of mainnet rows (micro-deploy `docs/network-consolidation.md` §2.2).
+   */
+  readonly databaseUrlTestnet: string
+  /**
+   * The network to assume when a request carries no `CF-Network`, or empty to refuse. Set for
+   * `pnpm dev`, which has no gateway. Never in production, where guessing makes a routing fault a
+   * silent cross-network write.
+   */
+  readonly singleNetwork: string
   readonly databasePoolMax: number
   readonly identityJwksUrl: string
   readonly identityIssuer: string
@@ -473,6 +485,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     version: optional(source, 'CLOUDSFORGE_TAG', 'dev'),
     logLevel: logLevel as Env['logLevel'],
     databaseUrl: required(source, 'WALLET_DATABASE_URL'),
+    databaseUrlTestnet: optional(source, 'WALLET_DATABASE_URL_TESTNET', ''),
+    singleNetwork: optional(source, 'CF_NETWORK_SINGLE', ''),
     // A pool larger than the database's own connection budget divided by the replica count is a
     // service that exhausts Postgres for everything else the moment it scales.
     databasePoolMax: integer(source, 'WALLET_DATABASE_POOL_MAX', 10, 1, 100),

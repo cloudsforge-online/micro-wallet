@@ -1,3 +1,4 @@
+import { networkSql, type NetworkSql } from '@cloudsforge/db'
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
@@ -127,6 +128,8 @@ async function withServer(
     metrics,
     verifier: options.verifier ?? workingVerifier(),
     network: 'testnet',
+    sql: singleNetworkSql(sql),
+    singleNetwork: 'testnet' as const,
     deposits: options.deposits ?? h.deposits,
     withdrawals: h.withdrawals,
     money: h.money,
@@ -1406,3 +1409,15 @@ test('a freeze names who asked for it and why, and tells the user neither', { sk
     assert.match(row[0]?.status_reason ?? '', /ops 4102: chargeback under review/)
   })
 })
+
+/**
+ * One handle, presented as the per-network selector `createServer` now takes.
+ *
+ * The suites run against a single test database, so testnet is the only configured network — which
+ * exercises the REFUSAL path for free: anything asking this for mainnet throws rather than quietly
+ * reusing the handle it does have. In wallet that refusal is the difference between a 500 somebody
+ * fixes and a user being shown the other estate's money.
+ */
+function singleNetworkSql(handle: unknown): NetworkSql {
+  return networkSql({ testnet: handle as never })
+}

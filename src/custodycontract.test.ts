@@ -46,6 +46,7 @@
  * red naming the field, rather than this file quietly agreeing with a stale copy of it.
  */
 
+import { networkSql, type NetworkSql } from '@cloudsforge/db'
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer as createHttpServer, type Server } from 'node:http'
@@ -563,6 +564,8 @@ test(
         metrics: registerServiceMetrics(registerHttpMetrics(new Metrics())),
         verifier: verifier(),
         network: 'testnet',
+        sql: singleNetworkSql(sql),
+        singleNetwork: 'testnet' as const,
         deposits: { ...h.deposits, custody: custody.client },
         withdrawals: h.withdrawals,
         money: h.money,
@@ -693,3 +696,15 @@ test('the assignment row keeps the binding a sweep will have to restate', { skip
     assert.equal(rows[0]?.custody_key_urn, `cf:custody:key:ember:testnet:${custodyAddress}`)
   })
 })
+
+/**
+ * One handle, presented as the per-network selector `createServer` now takes.
+ *
+ * The suites run against a single test database, so testnet is the only configured network — which
+ * exercises the REFUSAL path for free: anything asking this for mainnet throws rather than quietly
+ * reusing the handle it does have. In wallet that refusal is the difference between a 500 somebody
+ * fixes and a user being shown the other estate's money.
+ */
+function singleNetworkSql(handle: unknown): NetworkSql {
+  return networkSql({ testnet: handle as never })
+}

@@ -16,7 +16,7 @@
  */
 
 import postgres from 'postgres'
-import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
+import { assertSchemaAtLeast, type Sql as DbSql , networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier, serviceTokenProbe } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
@@ -65,12 +65,21 @@ logger.info('starting', {
 
 // 3. The database pool. Opened before the schema assertion because the assertion is a query, and
 //    before the Lifecycle because the readiness probe closes over it.
-const sql = postgres(env.databaseUrl, {
+const poolOptions = {
   max: env.databasePoolMax,
   // postgres.js writes notices to stderr as unstructured text by default, which is how a
   // connection string ends up in a log the collector cannot parse.
   onnotice: () => {},
-})
+}
+const sql = postgres(env.databaseUrl, poolOptions)
+
+// ── ONE HANDLE PER ESTATE ────────────────────────────────────────────────────────────────────
+//
+// `WALLET_DATABASE_URL_TESTNET` unset is the single-network case: `networkSql` then holds one
+// handle and REFUSES a testnet request rather than answering it from mainnet balances. In this
+// service that refusal is the difference between a 500 somebody fixes and a user being shown
+// somebody else's estate's money.
+const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poolOptions) : undefined
 
 // 4. Assert the schema. This does **not** migrate — the migrator job does, and it has already run
 //    by the time a container starts. Failing here rather than serving is the point: a replica of
@@ -266,6 +275,13 @@ const server = createServer({
   metrics,
   verifier,
   network: env.network,
+  // The SELECTOR, not a handle — routes use `ctx.sql`, resolved once per request, and
+  // `forRequest` rebuilds all four domain bundles against it.
+  sql: networkSql({
+    mainnet: sql as unknown as RuntimeSql,
+    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+  }),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   deposits,
   withdrawals,
   money,
