@@ -44,7 +44,7 @@
 
 import { chainSpec, type Network } from '@cloudsforge/contracts-chain'
 import { assetOf, familyOf, toChecksumAddress, type ChainId } from './addresses.ts'
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 import { recoverAddress } from './secp256k1.ts'
 
 /** 04-domain-model §3.2. The closed set of verification schemes. */

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 import {
   SignatureError,
   addressFromPublicKey,

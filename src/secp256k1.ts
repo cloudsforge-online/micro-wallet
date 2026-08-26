@@ -28,7 +28,7 @@
  * this file participates in producing the vectors it is checked against.
  */
 
-import { keccak256 } from './keccak.ts'
+import { keccak256 } from '@cloudsforge/evm'
 
 /** The prime field. p = 2^256 − 2^32 − 977. */
 const P = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn

@@ -26,6 +26,9 @@ importers:
       '@cloudsforge/db':
         specifier: link:../runtime/packages/db
         version: link:../runtime/packages/db
+      '@cloudsforge/evm':
+        specifier: link:../runtime/packages/evm
+        version: link:../runtime/packages/evm
       '@cloudsforge/http':
         specifier: link:../runtime/packages/http
         version: link:../runtime/packages/http
